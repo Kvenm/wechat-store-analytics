@@ -4,10 +4,11 @@
 
 ## 当前状态
 
-- 依赖已安装：`node_modules/`、`.venv/` 和 Playwright Chromium 已存在，不要重复安装。
+- 当前本机依赖已安装：`node_modules/`、`.venv/` 和 Playwright Chromium 已存在，继续开发时不要重复安装。
+- 新机器或别人从 GitHub clone 后，需要按 README 重新创建 `.venv`、安装 Python 依赖、执行 `npm install`，必要时再执行 `npx playwright install chromium`。
 - 当前不追求无人值守；首次登录、店铺确认、字段映射和异常数据确认都允许人工介入。
-- 已完成 `奥尚百货甄选店` 当前店铺的真实 `products` 小范围采集；该导出实际是“核心转化概览”，已按 `shop_daily` 导入。
-- 采集选择器仍是逐页校准模式；订单、评价、商品主表、多店切换未完成真实校准。
+- 当前最稳定主线是本地导出文件驱动：手动导出的 Excel/CSV/zip 可先校验，再导入、分析、生成报告。
+- 采集选择器仍是逐页校准模式；除已小范围跑通的订单导出路径外，评价、商品主表、多店切换、资金、投放等真实网页采集未完成稳定校准。
 - OpenAI API 当前只有 dry-run 骨架，不会真实请求。
 
 只有用户明确允许启动真实浏览器、服务或真实 OpenAI 调用后，才执行相关命令。普通导入、分析、报告和静态验证可以在本地执行。
@@ -22,15 +23,25 @@
 5. 人工复核异常数据和分析结论
 ```
 
-## 后续命令草案
+## 环境初始化
 
-依赖已安装，以下命令仅在环境重建时使用：
+新机器首次运行：
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 npm install
-python3 -m pip install -r requirements.txt
 npx playwright install chromium
 ```
+
+本机已安装依赖后，日常继续开发只需要激活虚拟环境：
+
+```bash
+source .venv/bin/activate
+```
+
+## 后续命令
 
 准备配置：
 
@@ -45,7 +56,7 @@ cp config/export-tasks.example.json config/export-tasks.json
 npm run collect -- --check-config --shop-id demo-shop --from 2026-06-01 --to 2026-06-07 --types orders,products,compass
 ```
 
-采集导出，需确认当前店铺和页面 selector 已校准：
+采集导出，需确认当前店铺和页面 selector 已校准。未校准页面不要直接跑真实采集：
 
 ```bash
 npm run collect -- --shop-id demo-shop --from 2026-06-01 --to 2026-06-07 --types orders,products,compass
@@ -80,6 +91,19 @@ python3 scripts/ai/build_payload.py --analysis-run-id ar_xxxxxxxxxxxx --db-path 
 
 ```bash
 python3 scripts/api/serve.py --host 127.0.0.1 --port 8000
+```
+
+本地导出文件校验：
+
+```bash
+python3 scripts/import/import_files.py \
+  --source-dir data/raw/example \
+  --shop-id demo-shop \
+  --shop-name "Demo WeChat Store" \
+  --task-id manual-demo-task \
+  --expected-types auto \
+  --manifest-policy ignore \
+  --check-only
 ```
 
 ## 注意事项
