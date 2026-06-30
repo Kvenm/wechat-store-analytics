@@ -15,10 +15,12 @@ from pydantic import BaseModel, Field
 
 from api.repository import LocalRepository
 from api.task_runner import TaskRunnerError
+from api.task_runner import check_local_export_files
 from api.task_runner import get_runtime_task
 from api.task_runner import list_runtime_tasks
 from api.task_runner import normalize_web_export_payload
 from api.task_runner import start_web_export_task
+from shared.module_registry import module_capabilities
 from shared.paths import PROJECT_ROOT
 
 
@@ -126,6 +128,11 @@ def health() -> dict[str, Any]:
     return response("ok", "API is ready.", repository().health())
 
 
+@app.get("/capabilities")
+def capabilities() -> dict[str, Any]:
+    return response("ok", "Collection capabilities loaded.", module_capabilities())
+
+
 @app.get("/api-config")
 def api_config() -> dict[str, Any]:
     return response("ok", "API config loaded.", read_api_config())
@@ -195,6 +202,15 @@ def check_task_request(payload: TaskRequest) -> dict[str, Any]:
     except TaskRunnerError as exc:
         return response("error", str(exc), {"request": model_to_dict(payload)})
     return response("ok", "Task request is valid.", spec)
+
+
+@app.post("/tasks/local-export/check")
+def check_local_export(payload: TaskRequest) -> dict[str, Any]:
+    try:
+        result = check_local_export_files(model_to_dict(payload))
+    except TaskRunnerError as exc:
+        return response("error", str(exc), {"request": model_to_dict(payload)})
+    return response("ok", "本地导出文件校验完成。", result)
 
 
 @app.get("/reports")
@@ -1267,6 +1283,141 @@ def render_admin_ui() -> str:
       background: #fff4f2;
       color: var(--danger);
     }
+    .check-summary {
+      display: grid;
+      gap: 10px;
+      color: #243044;
+    }
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 8px;
+    }
+    .metric-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      padding: 9px 10px;
+    }
+    .metric-card strong {
+      display: block;
+      color: var(--text);
+      font-size: 16px;
+      line-height: 1.2;
+      margin-bottom: 3px;
+    }
+    .metric-card span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .readiness-list {
+      display: grid;
+      gap: 6px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+    .readiness-list li {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+      color: #344054;
+    }
+    .readiness-mark {
+      flex: 0 0 auto;
+      width: 18px;
+      height: 18px;
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .readiness-mark.ok {
+      background: #e9f7ef;
+      color: var(--ok);
+    }
+    .readiness-mark.warn {
+      background: #fff3d6;
+      color: #996a00;
+    }
+    .warning-list {
+      margin: 0;
+      padding-left: 18px;
+      color: #5f4b16;
+    }
+    .readiness-panels,
+    .inspection-list {
+      display: grid;
+      gap: 8px;
+    }
+    .readiness-panel,
+    .inspection-item {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      padding: 9px 10px;
+      display: grid;
+      gap: 6px;
+    }
+    .readiness-panel-header,
+    .inspection-item-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .readiness-panel strong,
+    .inspection-item strong {
+      color: var(--text);
+      font-size: 13px;
+    }
+    .inspection-meta,
+    .field-match-list,
+    .readiness-summary {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .field-match-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+    }
+    .capability-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 8px;
+    }
+    .capability-item {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      padding: 10px;
+      display: grid;
+      gap: 7px;
+    }
+    .capability-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: flex-start;
+    }
+    .capability-title strong {
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.35;
+    }
+    .capability-title code {
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .capability-notes {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
     dl {
       display: grid;
       grid-template-columns: 120px minmax(0, 1fr);
@@ -1452,18 +1603,31 @@ def render_admin_ui() -> str:
           </form>
           <div class="notice">
             <strong>离线导入：本地导出复跑</strong>
-            <p>无法扫码测试时，可选择项目 data/raw 下已经下载过的导出目录，使用 source_type=local_export 直接导入、分析、生成报告。</p>
+            <p>无法扫码测试时，可选择项目 data/raw 下已经下载过的导出目录；正式采集目录和手动放入的 Excel/CSV/zip 目录都可以先校验。</p>
           </div>
           <form id="localExportForm" class="form-grid">
             <label class="full">
               source_dir
               <input id="localSourceDir" name="source_dir" autocomplete="off" placeholder="data/raw/collect_yijia-baihuo_2026-06-01_2026-06-03_20260628T094048Z">
             </label>
+            <label>
+              导入类型
+              <select id="localExportTypes" name="types">
+                <option value="auto">自动识别导出文件</option>
+              </select>
+            </label>
             <div class="button-row full">
+              <button type="button" id="checkLocalExportTask">校验本地导出文件</button>
               <button type="submit" id="startLocalExportTask">复跑本地导出文件</button>
-              <span class="hint">只允许项目 data/raw 下包含 task-metadata.json 的目录。</span>
+              <span class="hint">只允许项目 data/raw 下的目录；没有 task-metadata.json 时会按手动导出目录处理。</span>
             </div>
           </form>
+          <div class="notice">
+            <strong>模块能力</strong>
+            <p>真实网页采集只开放已校准模块；本地导入可以先处理你手动从后台导出的 Excel、CSV 或 zip。</p>
+          </div>
+          <div id="capabilityMessage" class="message">读取 /capabilities 中...</div>
+          <div id="capabilitiesPanel" class="capability-grid"></div>
           <div class="status-row">
             <span id="taskStateChip" class="chip">任务未启动</span>
             <span id="taskReportChip" class="chip">报告未生成</span>
@@ -1577,12 +1741,12 @@ def render_admin_ui() -> str:
   </main>
 
   <script>
-    const state = { activeRecords: "tasks", activeTaskId: null, taskPoller: null };
+    const state = { activeRecords: "tasks", activeTaskId: null, taskPoller: null, capabilities: [] };
     const $ = (id) => document.getElementById(id);
     const taskStepLabels = {
       collect: "导出/本地文件",
       import_metadata: "导入任务",
-      import_files: "导入订单",
+      import_files: "导入数据",
       analyze: "计算指标",
       report: "生成报告",
     };
@@ -1768,10 +1932,179 @@ def render_admin_ui() -> str:
       }
     }
 
+    async function loadCapabilities() {
+      setMessage("capabilityMessage", "读取 /capabilities 中...");
+      try {
+        const capabilities = await fetchJson("/capabilities");
+        state.capabilities = capabilities || [];
+        renderCapabilities(state.capabilities);
+        renderLocalExportTypeOptions(state.capabilities);
+        setMessage("capabilityMessage", "模块能力已加载。", "ok");
+      } catch (error) {
+        setMessage("capabilityMessage", error.message, "error");
+      }
+    }
+
+    function renderLocalExportTypeOptions(capabilities) {
+      const select = $("localExportTypes");
+      const previous = select.value || "auto";
+      const importable = (capabilities || []).filter((item) => item.import_enabled);
+      const options = [
+        '<option value="auto">自动识别导出文件</option>',
+        ...importable.map((item) => `<option value="${escapeHtml(String(item.export_type))}">${escapeHtml(item.label || item.export_type)}</option>`),
+      ];
+      select.innerHTML = options.join("");
+      const values = new Set([...select.options].map((option) => option.value));
+      select.value = values.has(previous) ? previous : "auto";
+    }
+
+    function renderCapabilities(capabilities) {
+      const el = $("capabilitiesPanel");
+      if (!capabilities || !capabilities.length) {
+        el.innerHTML = '<div class="empty">暂无模块能力</div>';
+        return;
+      }
+      el.innerHTML = capabilities.map((item) => {
+        const webClass = item.web_enabled ? "ok" : "bad";
+        const importClass = item.import_enabled ? "ok" : "bad";
+        const calibratedClass = item.calibrated ? "ok" : "bad";
+        return `
+          <div class="capability-item">
+            <div class="capability-title">
+              <strong>${escapeHtml(item.label || item.export_type)}</strong>
+              <code>${escapeHtml(item.export_type)}</code>
+            </div>
+            <div class="status-row">
+              <span class="chip ${webClass}">网页${item.web_enabled ? "已开放" : "待校准"}</span>
+              <span class="chip ${importClass}">导入${item.import_enabled ? "可用" : "未开放"}</span>
+              <span class="chip ${calibratedClass}">${item.calibrated ? "已校准" : "未校准"}</span>
+            </div>
+            <div class="capability-notes">${escapeHtml(item.notes || "")}</div>
+          </div>
+        `;
+      }).join("");
+    }
+
     function setTaskResult(text, kind = "") {
       const el = $("taskResult");
       el.textContent = text;
       el.className = `result-box ${kind}`.trim();
+    }
+
+    function setTaskResultHtml(html, kind = "") {
+      const el = $("taskResult");
+      el.innerHTML = html;
+      el.className = `result-box ${kind}`.trim();
+    }
+
+    function renderLocalExportCheckResult(result) {
+      const counts = result.batch_counts || {};
+      const inspection = result.inspection || {};
+      const tables = inspection.totals?.tables || Object.fromEntries(
+        Object.entries(counts).filter(([key, value]) => key !== "warnings" && Number(value || 0) > 0)
+      );
+      const metricCards = renderMetricCards(tables);
+      const readinessHtml = renderBusinessReadiness(inspection.business_readiness || []);
+      const inspectionHtml = renderImportInspection(inspection.source_inspections || []);
+      const warnings = (result.warnings || []).slice(0, 5);
+      const warningHtml = warnings.length
+        ? `<ol class="warning-list">${warnings.map((warning) => `<li>${escapeHtml(warning.code || "warning")}：${escapeHtml(warning.message || "")}</li>`).join("")}</ol>`
+        : '<p>没有导入警告。</p>';
+      setTaskResultHtml(`
+        <div class="check-summary">
+          <div><strong>本地导出校验完成</strong> · ${escapeHtml(result.mode || "check_only")} · warnings=${escapeHtml(String(counts.warnings || 0))}</div>
+          <div class="metric-grid">${metricCards}</div>
+          ${readinessHtml}
+          ${inspectionHtml}
+          <div>${warningHtml}</div>
+        </div>
+      `, "ok");
+    }
+
+    function renderMetricCards(tables) {
+      const nonZeroCounts = Object.entries(tables || {})
+        .filter(([, value]) => Number(value || 0) > 0);
+      return nonZeroCounts.length
+        ? nonZeroCounts.map(([table, value]) => `<div class="metric-card"><strong>${escapeHtml(String(value))}</strong><span>${escapeHtml(table)}</span></div>`).join("")
+        : '<div class="metric-card"><strong>0</strong><span>可识别数据行</span></div>';
+    }
+
+    function renderBusinessReadiness(items) {
+      if (!items.length) {
+        return "";
+      }
+      const rows = items.map((item) => {
+        const status = item.status || "blocked";
+        const chipClass = status === "supported" ? "ok" : "bad";
+        const missing = (item.missing || []).length ? `缺口：${item.missing.join("、")}` : "";
+        const decisions = (item.limited_decisions || []).slice(0, 2).join(" ");
+        return `
+          <div class="readiness-panel">
+            <div class="readiness-panel-header">
+              <strong>${escapeHtml(item.label || item.key || "业务能力")}</strong>
+              <span class="chip ${chipClass}">${escapeHtml(statusLabel(status))}</span>
+            </div>
+            <div class="readiness-summary">${escapeHtml(item.summary || "")}</div>
+            ${missing ? `<div class="inspection-meta">${escapeHtml(missing)}</div>` : ""}
+            ${decisions ? `<div class="inspection-meta">${escapeHtml(decisions)}</div>` : ""}
+          </div>
+        `;
+      }).join("");
+      return `<div class="readiness-panels">${rows}</div>`;
+    }
+
+    function renderImportInspection(items) {
+      if (!items.length) {
+        return '<div class="inspection-list"><div class="inspection-item"><strong>未生成文件级校验明细</strong><div class="inspection-meta">当前结果只有总行数和 warning。</div></div></div>';
+      }
+      const rows = items.map((item) => {
+        const table = item.selected_table || item.guessed_table || "未识别";
+        const status = item.status || "unknown";
+        const rowCounts = item.row_counts || {};
+        const derived = rowCounts.derived_tables || {};
+        const derivedText = Object.entries(derived)
+          .filter(([, value]) => Number(value || 0) > 0)
+          .map(([name, value]) => `${name}=${value}`)
+          .join("，");
+        const missingColumns = (item.missing_required_columns || []).join("、");
+        const missingValues = (item.missing_required_values || [])
+          .map((entry) => `${entry.field} 缺 ${entry.count} 行`)
+          .join("，");
+        const fields = (item.field_matches || []).slice(0, 12).map((field) => (
+          `<span class="chip">${escapeHtml(field.field)} ← ${escapeHtml(field.header)} · ${escapeHtml(field.match_method || "")}</span>`
+        )).join("");
+        return `
+          <div class="inspection-item">
+            <div class="inspection-item-header">
+              <strong>${escapeHtml(table)} · ${escapeHtml(shortFileName(item.source_file || ""))}${item.source_sheet ? ` / ${escapeHtml(item.source_sheet)}` : ""}</strong>
+              <span class="chip ${status === "importable" ? "ok" : status === "needs_review" ? "" : "bad"}">${escapeHtml(statusLabel(status))}</span>
+            </div>
+            <div class="inspection-meta">识别依据：${escapeHtml(item.selected_reason || "-")} · 原始行 ${escapeHtml(String(rowCounts.raw_rows ?? 0))} · 可导入 ${escapeHtml(String(rowCounts.imported_rows ?? 0))}${derivedText ? ` · 派生 ${escapeHtml(derivedText)}` : ""}</div>
+            ${fields ? `<div class="field-match-list">${fields}</div>` : '<div class="inspection-meta">没有匹配到标准字段。</div>'}
+            ${missingColumns ? `<div class="inspection-meta">缺关键列：${escapeHtml(missingColumns)}</div>` : ""}
+            ${missingValues ? `<div class="inspection-meta">缺关键值：${escapeHtml(missingValues)}</div>` : ""}
+          </div>
+        `;
+      }).join("");
+      return `<div class="inspection-list">${rows}</div>`;
+    }
+
+    function statusLabel(status) {
+      const labels = {
+        supported: "可支持",
+        limited: "受限",
+        blocked: "缺数据",
+        importable: "可导入",
+        needs_review: "需复核",
+        skipped: "已跳过",
+        unrecognized: "未识别",
+        empty: "空表",
+      };
+      return labels[status] || status || "-";
+    }
+
+    function shortFileName(path) {
+      return String(path || "").split(/[\\/]/).filter(Boolean).pop() || path || "-";
     }
 
     function renderTask(task) {
@@ -1807,8 +2140,22 @@ def render_admin_ui() -> str:
       if (task.error?.message) {
         setTaskResult(task.error.message, "error");
       } else if (task.result) {
+        const importInspection = task.result.import_summary?.inspection;
+        if (importInspection) {
+          const counts = task.result.import_summary?.batch_counts || {};
+          const tables = importInspection.totals?.tables || {};
+          setTaskResultHtml(`
+            <div class="check-summary">
+              <div><strong>任务已完成</strong> · ${escapeHtml(task.source_type || "task")} · warnings=${escapeHtml(String(counts.warnings || 0))}</div>
+              <div class="metric-grid">${renderMetricCards(tables)}</div>
+              ${renderBusinessReadiness(importInspection.business_readiness || [])}
+              ${renderImportInspection(importInspection.source_inspections || [])}
+            </div>
+          `, "ok");
+          return;
+        }
         const parts = [
-          `订单导出文件数：${task.result.artifact_count ?? "-"}`,
+          `导出/导入文件数：${task.result.artifact_count ?? "-"}`,
           `analysis_run_id：${task.result.analysis_run_id || "-"}`,
           `report_id：${reportId || "-"}`,
           `source_dir：${task.result.source_dir || "-"}`,
@@ -1874,6 +2221,14 @@ def render_admin_ui() -> str:
 
     async function startLocalExportTask(event) {
       event.preventDefault();
+      await submitLocalExportTask("/tasks", "正在复跑本地导出文件...", "本地复跑任务已启动，正在轮询进度。", true);
+    }
+
+    async function checkLocalExportTask() {
+      await submitLocalExportTask("/tasks/local-export/check", "正在校验本地导出文件...", "本地导出文件校验完成。", false);
+    }
+
+    async function submitLocalExportTask(url, pendingMessage, successMessage, shouldPoll) {
       const payload = {
         shop_id: $("collectShopId").value,
         task_name: "本地导出复跑分析",
@@ -1883,21 +2238,25 @@ def render_admin_ui() -> str:
           shop_name: $("collectShopName").value,
           from: $("collectFrom").value,
           to: $("collectTo").value,
-          types: ["orders"],
+          types: [$("localExportTypes").value],
           source_dir: $("localSourceDir").value,
         },
       };
-      setMessage("taskMessage", "正在复跑本地导出文件...");
+      setMessage("taskMessage", pendingMessage);
       try {
-        const task = await fetchJson("/tasks", {
+        const task = await fetchJson(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
-        state.activeTaskId = task.id || task.task_id;
-        renderTask(task);
-        setMessage("taskMessage", "本地复跑任务已启动，正在轮询进度。", "ok");
-        startTaskPolling(state.activeTaskId);
+        if (shouldPoll) {
+          state.activeTaskId = task.id || task.task_id;
+          renderTask(task);
+          startTaskPolling(state.activeTaskId);
+        } else {
+          renderLocalExportCheckResult(task);
+        }
+        setMessage("taskMessage", successMessage, "ok");
       } catch (error) {
         setMessage("taskMessage", error.message, "error");
       }
@@ -2032,7 +2391,7 @@ def render_admin_ui() -> str:
 
     async function refreshAll() {
       setDefaultDates();
-      await Promise.all([loadHealth(), loadConfig(), loadWebLoginStatus(), loadTasks(), loadRecords()]);
+      await Promise.all([loadHealth(), loadConfig(), loadWebLoginStatus(), loadCapabilities(), loadTasks(), loadRecords()]);
     }
 
     $("configForm").addEventListener("submit", saveConfig);
@@ -2045,6 +2404,7 @@ def render_admin_ui() -> str:
     $("openWebLogin").addEventListener("click", openWebLogin);
     $("orderTaskForm").addEventListener("submit", startOrderTask);
     $("localExportForm").addEventListener("submit", startLocalExportTask);
+    $("checkLocalExportTask").addEventListener("click", checkLocalExportTask);
     $("refreshTasks").addEventListener("click", loadTasks);
     $("tasksTab").addEventListener("click", () => selectRecordsTab("tasks"));
     $("syncRunsTab").addEventListener("click", () => selectRecordsTab("syncRuns"));

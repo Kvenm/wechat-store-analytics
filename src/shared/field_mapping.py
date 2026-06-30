@@ -57,6 +57,26 @@ def match_fields(
     custom_map: Mapping[str, Mapping[str, Sequence[str]]] | None = None,
     include_warnings: bool = True,
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
+    details, warnings = match_fields_detail(
+        headers,
+        table,
+        custom_map,
+        include_warnings=include_warnings,
+    )
+    matches = {
+        str(detail["field"]): str(detail["header"])
+        for detail in details
+        if detail.get("header")
+    }
+    return matches, warnings
+
+
+def match_fields_detail(
+    headers: Sequence[object],
+    table: str,
+    custom_map: Mapping[str, Mapping[str, Sequence[str]]] | None = None,
+    include_warnings: bool = True,
+) -> tuple[list[dict[str, object]], list[dict[str, str]]]:
     warnings: list[dict[str, str]] = []
     source_headers = [str(header).strip() for header in headers if str(header).strip()]
     normalized_to_header: dict[str, str] = {}
@@ -65,22 +85,30 @@ def match_fields(
         if normalized and normalized not in normalized_to_header:
             normalized_to_header[normalized] = header
 
-    matches: dict[str, str] = {}
+    details: list[dict[str, object]] = []
     used_headers: set[str] = set()
-    for spec in specs_for(table, custom_map):
+    custom_fields = custom_map.get(table, {}) if custom_map else {}
+    for spec in specs_for_table(table):
+        header: str | None = None
+        match_method = "missing"
         for alias in spec.aliases:
-            normalized_alias = normalize_header(alias)
-            header = normalized_to_header.get(normalized_alias)
-            if header and header not in used_headers:
-                matches[spec.name] = header
-                used_headers.add(header)
+            header = _header_for_alias(normalized_to_header, alias, used_headers)
+            if header:
+                match_method = "alias"
                 break
 
-        if spec.name not in matches:
+        if not header:
+            for alias in custom_fields.get(spec.name, ()):
+                header = _header_for_alias(normalized_to_header, alias, used_headers)
+                if header:
+                    match_method = "custom"
+                    break
+
+        if not header:
             heuristic_header = _match_by_tokens(source_headers, spec.name, used_headers)
             if heuristic_header:
-                matches[spec.name] = heuristic_header
-                used_headers.add(heuristic_header)
+                header = heuristic_header
+                match_method = "heuristic"
                 if include_warnings:
                     warnings.append(
                         {
@@ -91,7 +119,20 @@ def match_fields(
                         }
                     )
 
-        if include_warnings and spec.required and spec.name not in matches:
+        if header:
+            used_headers.add(header)
+
+        details.append(
+            {
+                "field": spec.name,
+                "header": header or "",
+                "kind": spec.kind,
+                "required": bool(spec.required),
+                "match_method": match_method,
+            }
+        )
+
+        if include_warnings and spec.required and not header:
             warnings.append(
                 {
                     "code": "missing_required_column",
@@ -100,7 +141,19 @@ def match_fields(
                     "message": f"{table} 缺少关键字段 {spec.name}",
                 }
             )
-    return matches, warnings
+    return details, warnings
+
+
+def _header_for_alias(
+    normalized_to_header: Mapping[str, str],
+    alias: str,
+    used_headers: set[str],
+) -> str | None:
+    normalized_alias = normalize_header(alias)
+    header = normalized_to_header.get(normalized_alias)
+    if header and header not in used_headers:
+        return header
+    return None
 
 
 def guess_table(

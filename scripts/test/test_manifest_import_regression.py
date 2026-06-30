@@ -29,6 +29,8 @@ if importlib.util.find_spec("pandas") is None:
 
 from ingestion.models import STANDARD_TABLES  # noqa: E402
 from ingestion.pipeline import build_import_batch  # noqa: E402
+from shared.analysis_capabilities import build_business_readiness  # noqa: E402
+from warehouse.repository import connect, import_batch, initialize_database  # noqa: E402
 
 
 SHOP_ID = "test-shop"
@@ -46,6 +48,22 @@ PRODUCTS_HEADERS = ("product_id", "product_name", "price", "stock", "status")
 PRODUCTS_ROWS = (
     ("product-001", "Coffee Mug", "19.90", "30", "online"),
     ("product-002", "Canvas Bag", "29.90", "12", "online"),
+)
+
+PRODUCT_LIST_HEADERS = (
+    "商品ID",
+    "商品名称",
+    "SKU ID",
+    "规格名称",
+    "销售价",
+    "可售库存",
+    "商品类目",
+    "上下架状态",
+    "商家编码",
+)
+PRODUCT_LIST_ROWS = (
+    ("p-001", "夏季连衣裙", "sku-001", "M码", "129.00", "20", "女装", "销售中", "B001"),
+    ("p-001", "夏季连衣裙", "sku-002", "L码", "129.00", "12", "女装", "销售中", "B002"),
 )
 
 AUDIENCE_HEADERS = (
@@ -127,6 +145,68 @@ FULL_ORDER_EXPORT_ROWS = (
     ),
 )
 
+REVIEWS_HEADERS = (
+    "评价编号",
+    "订单号",
+    "商品名称",
+    "SKU ID",
+    "评价星级",
+    "评价详情",
+    "评价创建时间",
+    "商家回复内容",
+)
+REVIEWS_ROWS = (
+    ("review-001", "wx-order-001", "夏季连衣裙", "sku-001", "2", "尺码偏小，面料薄", "2026-06-22 09:00:00", "已联系处理"),
+)
+
+AFTERSALE_HEADERS = (
+    "售后编号",
+    "订单号",
+    "商品ID",
+    "商品名称",
+    "SKU ID",
+    "售后状态",
+    "实退金额",
+    "申请售后时间",
+    "退款成功时间",
+    "原因说明",
+)
+AFTERSALE_ROWS = (
+    ("as-001", "wx-order-001", "p-001", "夏季连衣裙", "sku-001", "退款成功", "20.00", "2026-06-22 10:00:00", "2026-06-22 12:00:00", "尺码偏小"),
+)
+
+FUND_FLOW_HEADERS = (
+    "账单号",
+    "记账时间",
+    "账务类型",
+    "业务类型",
+    "订单号",
+    "收入金额",
+    "收支方向",
+    "当前余额",
+    "备注",
+)
+FUND_FLOW_ROWS = (
+    ("flow-001", "2026-06-22 13:00:00", "收入", "订单结算", "wx-order-001", "100.00", "收入", "1000.00", "订单入账"),
+)
+
+AD_SPEND_HEADERS = (
+    "投放日期",
+    "推广计划ID",
+    "推广计划名称",
+    "推广单元名称",
+    "商品名称",
+    "曝光次数",
+    "点击次数",
+    "花费金额",
+    "成交GMV",
+    "成交订单量",
+    "ROAS",
+)
+AD_SPEND_ROWS = (
+    ("2026-06-22", "camp-001", "连衣裙放量", "华东女性", "夏季连衣裙", "10000", "320", "200.00", "800.00", "6", "4.0"),
+)
+
 
 class CsvColumns(list[str]):
     def tolist(self) -> list[str]:
@@ -188,6 +268,14 @@ def main() -> int:
         test_products_analytics_manifest_imports_shop_daily,
         test_hash_mismatch_skips_artifact,
         test_export_type_fallback_imports_mapped_table,
+        test_product_list_export_imports_products_and_derives_skus,
+        test_expected_types_skip_unexpected_tables_without_manifest,
+        test_expected_types_auto_imports_all_detected_tables_without_manifest,
+        test_auto_imports_reviews_refunds_funds_and_ads_without_manifest,
+        test_import_inspection_describes_mixed_business_tables,
+        test_import_inspection_tracks_derived_order_and_sku_tables,
+        test_manifest_export_type_aliases_import_business_tables,
+        test_auto_business_tables_import_into_sqlite,
         test_full_order_export_derives_items_and_refunds,
         test_zip_export_imports_nested_workbook,
         test_empty_manifest_imports_nothing,
@@ -308,6 +396,234 @@ def test_export_type_fallback_imports_mapped_table() -> None:
 
         assert_counts(batch, audience_insights=2)
         assert_has_warning(batch, "manifest_export_type_used")
+
+
+def test_product_list_export_imports_products_and_derives_skus() -> None:
+    with temp_source_dir() as source_dir:
+        product_list_path = Path(source_dir) / "导出商品.csv"
+        write_csv(product_list_path, PRODUCT_LIST_HEADERS, PRODUCT_LIST_ROWS)
+        write_manifest(source_dir, [artifact_for(product_list_path, table_hint="products", export_type="product_list")])
+
+        batch = import_source(source_dir)
+
+        assert_counts(batch, products=2, product_skus=2)
+        assert_has_warning(batch, "product_list_skus_derived")
+        first_product = batch.products[0]
+        assert first_product["product_id"] == "p-001"
+        assert first_product["product_name"] == "夏季连衣裙"
+        assert first_product["price"] == 129.0
+        assert first_product["stock"] == 20.0
+        first_sku = batch.product_skus[0]
+        assert first_sku["product_id"] == "p-001"
+        assert first_sku["sku_id"] == "sku-001"
+        assert first_sku["sku_name"] == "M码"
+        assert first_sku["sku_price"] == 129.0
+        assert first_sku["barcode"] == "B001"
+
+
+def test_expected_types_skip_unexpected_tables_without_manifest() -> None:
+    with temp_source_dir() as source_dir:
+        product_list_path = Path(source_dir) / "导出商品.csv"
+        orders_path = Path(source_dir) / "orders.csv"
+        write_csv(product_list_path, PRODUCT_LIST_HEADERS, PRODUCT_LIST_ROWS)
+        write_csv(orders_path, ORDERS_HEADERS, ORDERS_ROWS)
+
+        batch = build_import_batch(
+            source_dir=source_dir,
+            shop_id=SHOP_ID,
+            task_id=TASK_ID,
+            shop_name=SHOP_NAME,
+            expected_types=["product_list"],
+            manifest_policy="ignore",
+        )
+
+        assert_counts(batch, orders=0, products=2, product_skus=2)
+        assert_has_warning(batch, "unexpected_table_for_expected_types")
+        assert_has_warning(batch, "product_list_skus_derived")
+
+
+def test_expected_types_auto_imports_all_detected_tables_without_manifest() -> None:
+    with temp_source_dir() as source_dir:
+        product_list_path = Path(source_dir) / "导出商品.csv"
+        orders_path = Path(source_dir) / "orders.csv"
+        write_csv(product_list_path, PRODUCT_LIST_HEADERS, PRODUCT_LIST_ROWS)
+        write_csv(orders_path, ORDERS_HEADERS, ORDERS_ROWS)
+
+        batch = build_import_batch(
+            source_dir=source_dir,
+            shop_id=SHOP_ID,
+            task_id=TASK_ID,
+            shop_name=SHOP_NAME,
+            expected_types=["auto"],
+            manifest_policy="ignore",
+        )
+
+        assert_counts(batch, orders=2, products=2, product_skus=2)
+        assert_no_warning(batch, "unexpected_table_for_expected_types")
+        assert_has_warning(batch, "product_list_skus_derived")
+
+
+def test_auto_imports_reviews_refunds_funds_and_ads_without_manifest() -> None:
+    with temp_source_dir() as source_dir:
+        write_csv(Path(source_dir) / "商品评价.csv", REVIEWS_HEADERS, REVIEWS_ROWS)
+        write_csv(Path(source_dir) / "售后订单.csv", AFTERSALE_HEADERS, AFTERSALE_ROWS)
+        write_csv(Path(source_dir) / "资金流水.csv", FUND_FLOW_HEADERS, FUND_FLOW_ROWS)
+        write_csv(Path(source_dir) / "投放数据.csv", AD_SPEND_HEADERS, AD_SPEND_ROWS)
+
+        batch = build_import_batch(
+            source_dir=source_dir,
+            shop_id=SHOP_ID,
+            task_id=TASK_ID,
+            shop_name=SHOP_NAME,
+            expected_types=["auto"],
+            manifest_policy="ignore",
+        )
+
+        assert_counts(batch, reviews=1, refunds=1, fund_flows=1, ad_spend=1)
+        assert_no_warning(batch, "unexpected_table_for_expected_types")
+        review = batch.reviews[0]
+        assert review["review_id"] == "review-001"
+        assert review["rating"] == 2.0
+        assert review["review_content"] == "尺码偏小，面料薄"
+        assert review["review_created_at"].startswith("2026-06-22")
+        assert review["is_positive"] == "0"
+        refund = batch.refunds[0]
+        assert refund["refund_id"] == "as-001"
+        assert refund["refund_amount"] == 20.0
+        assert refund["reason"] == "尺码偏小"
+        fund_flow = batch.fund_flows[0]
+        assert fund_flow["flow_id"] == "flow-001"
+        assert fund_flow["amount"] == 100.0
+        assert fund_flow["currency"] == "CNY"
+        ad = batch.ad_spend[0]
+        assert ad["campaign_id"] == "camp-001"
+        assert ad["spend_amount"] == 200.0
+        assert ad["payment_amount"] == 800.0
+        assert ad["roi"] == 4.0
+        assert ad["platform"] == "wechat"
+
+
+def test_import_inspection_describes_mixed_business_tables() -> None:
+    with temp_source_dir() as source_dir:
+        write_csv(Path(source_dir) / "商品评价.csv", REVIEWS_HEADERS, REVIEWS_ROWS)
+        write_csv(Path(source_dir) / "售后订单.csv", AFTERSALE_HEADERS, AFTERSALE_ROWS)
+        write_csv(Path(source_dir) / "资金流水.csv", FUND_FLOW_HEADERS, FUND_FLOW_ROWS)
+        write_csv(Path(source_dir) / "投放数据.csv", AD_SPEND_HEADERS, AD_SPEND_ROWS)
+
+        batch = build_import_batch(
+            source_dir=source_dir,
+            shop_id=SHOP_ID,
+            task_id=TASK_ID,
+            shop_name=SHOP_NAME,
+            expected_types=["auto"],
+            manifest_policy="ignore",
+        )
+        inspection = batch.inspection_summary(source_dir=source_dir)
+        inspection["business_readiness"] = build_business_readiness(inspection)
+
+        by_table = {item["selected_table"]: item for item in inspection["source_inspections"]}
+        assert set(by_table) >= {"reviews", "refunds", "fund_flows", "ad_spend"}
+        review = by_table["reviews"]
+        assert review["status"] == "importable", review
+        assert review["row_counts"]["raw_rows"] == 1
+        assert review["row_counts"]["imported_rows"] == 1
+        assert any(field["field"] == "review_content" and field["match_method"] == "alias" for field in review["field_matches"])
+        readiness = {item["key"]: item for item in inspection["business_readiness"]}
+        assert readiness["review_insights"]["status"] == "supported"
+        assert readiness["refund_risk"]["status"] == "limited"
+        assert readiness["ad_roi"]["status"] == "supported"
+        assert readiness["fund_reconciliation"]["status"] == "supported"
+        assert readiness["order_kpi"]["status"] == "blocked"
+
+
+def test_import_inspection_tracks_derived_order_and_sku_tables() -> None:
+    with temp_source_dir() as source_dir:
+        write_csv(Path(source_dir) / "orders-full.csv", FULL_ORDER_EXPORT_HEADERS, FULL_ORDER_EXPORT_ROWS)
+        write_csv(Path(source_dir) / "导出商品.csv", PRODUCT_LIST_HEADERS, PRODUCT_LIST_ROWS)
+
+        batch = build_import_batch(
+            source_dir=source_dir,
+            shop_id=SHOP_ID,
+            task_id=TASK_ID,
+            shop_name=SHOP_NAME,
+            expected_types=["auto"],
+            manifest_policy="ignore",
+        )
+        inspection = batch.inspection_summary(source_dir=source_dir)
+
+        order_inspection = next(item for item in inspection["source_inspections"] if item["selected_table"] == "orders")
+        product_inspection = next(item for item in inspection["source_inspections"] if item["selected_table"] == "products")
+        assert order_inspection["row_counts"]["imported_rows"] == 2
+        assert order_inspection["row_counts"]["derived_tables"] == {"order_items": 2, "refunds": 1}
+        assert product_inspection["row_counts"]["imported_rows"] == 2
+        assert product_inspection["row_counts"]["derived_tables"] == {"product_skus": 2}
+        assert inspection["totals"]["tables"]["orders"] == 2
+        assert inspection["totals"]["tables"]["order_items"] == 2
+        assert inspection["totals"]["tables"]["refunds"] == 1
+        assert inspection["totals"]["tables"]["products"] == 2
+        assert inspection["totals"]["tables"]["product_skus"] == 2
+
+
+def test_manifest_export_type_aliases_import_business_tables() -> None:
+    with temp_source_dir() as source_dir:
+        review_path = Path(source_dir) / "comment.csv"
+        refund_path = Path(source_dir) / "aftersale.csv"
+        fund_path = Path(source_dir) / "bill.csv"
+        ad_path = Path(source_dir) / "promotion.csv"
+        write_csv(review_path, REVIEWS_HEADERS, REVIEWS_ROWS)
+        write_csv(refund_path, AFTERSALE_HEADERS, AFTERSALE_ROWS)
+        write_csv(fund_path, FUND_FLOW_HEADERS, FUND_FLOW_ROWS)
+        write_csv(ad_path, AD_SPEND_HEADERS, AD_SPEND_ROWS)
+        write_manifest(
+            source_dir,
+            [
+                artifact_for(review_path, export_type="comment"),
+                artifact_for(refund_path, export_type="aftersale"),
+                artifact_for(fund_path, export_type="bill"),
+                artifact_for(ad_path, export_type="promotion"),
+            ],
+        )
+
+        batch = import_source(source_dir)
+
+        assert_counts(batch, reviews=1, refunds=1, fund_flows=1, ad_spend=1)
+        assert_has_warning(batch, "manifest_export_type_used")
+
+
+def test_auto_business_tables_import_into_sqlite() -> None:
+    with temp_source_dir() as source_dir:
+        write_csv(Path(source_dir) / "商品评价.csv", REVIEWS_HEADERS, REVIEWS_ROWS)
+        write_csv(Path(source_dir) / "售后订单.csv", AFTERSALE_HEADERS, AFTERSALE_ROWS)
+        write_csv(Path(source_dir) / "资金流水.csv", FUND_FLOW_HEADERS, FUND_FLOW_ROWS)
+        write_csv(Path(source_dir) / "投放数据.csv", AD_SPEND_HEADERS, AD_SPEND_ROWS)
+        batch = build_import_batch(
+            source_dir=source_dir,
+            shop_id=SHOP_ID,
+            task_id=TASK_ID,
+            shop_name=SHOP_NAME,
+            expected_types=["auto"],
+            manifest_policy="ignore",
+        )
+        with connect(":memory:") as conn:
+            initialize_database(conn)
+            counts = import_batch(conn, batch)
+            refund = conn.execute("SELECT refund_amount, reason FROM refunds").fetchone()
+            review = conn.execute("SELECT rating, is_positive FROM reviews").fetchone()
+            fund = conn.execute("SELECT amount, currency FROM fund_flows").fetchone()
+            ad = conn.execute("SELECT spend_amount, platform FROM ad_spend").fetchone()
+
+    assert counts["refunds"] == 1
+    assert counts["reviews"] == 1
+    assert counts["fund_flows"] == 1
+    assert counts["ad_spend"] == 1
+    assert refund["refund_amount"] == 20.0
+    assert refund["reason"] == "尺码偏小"
+    assert review["rating"] == 2.0
+    assert review["is_positive"] == "0"
+    assert fund["amount"] == 100.0
+    assert fund["currency"] == "CNY"
+    assert ad["spend_amount"] == 200.0
+    assert ad["platform"] == "wechat"
 
 
 def test_full_order_export_derives_items_and_refunds() -> None:

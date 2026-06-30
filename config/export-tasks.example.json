@@ -62,6 +62,17 @@
         "exportButton": "TODO_SELECTOR_ORDERS_EXPORT_BUTTON"
       }
     },
+    "product_list": {
+      "label": "Product list export",
+      "tableHint": "products",
+      "path": "TODO_PATH_PRODUCT_LIST_EXPORT_PAGE",
+      "notes": "商品管理-商品列表/导出商品，用于商品主表和 SKU 表；不要和店铺数据-商品数据概览混用。",
+      "expectedFormats": ["xlsx", "csv"],
+      "selectors": {
+        "pageReady": "TODO_SELECTOR_PRODUCT_LIST_PAGE_READY",
+        "exportButton": "TODO_SELECTOR_PRODUCT_LIST_EXPORT_BUTTON"
+      }
+    },
     "products": {
       "label": "Product analytics export",
       "tableHint": "shop_daily",

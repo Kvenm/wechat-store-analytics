@@ -31,7 +31,13 @@ def main() -> int:
         test_empty_secret_and_token_do_not_overwrite_existing_values,
         test_root_html_contains_core_admin_ui_elements,
         test_root_html_marks_local_export_entry_frontend_pending,
+        test_capabilities_exposes_registry_without_secrets,
         test_task_check_accepts_only_supported_order_export,
+        test_task_check_accepts_local_export_product_list,
+        test_task_check_accepts_local_export_auto,
+        test_local_export_deep_check_reads_files_without_starting_task,
+        test_manual_export_without_metadata_can_be_checked,
+        test_manual_export_auto_detects_mixed_tables,
         test_task_check_accepts_source_type_local_export,
         test_task_check_accepts_params_mode_local_export,
         test_task_check_rejects_out_of_bounds_local_export_source_dir,
@@ -214,7 +220,7 @@ def test_root_html_contains_core_admin_ui_elements() -> None:
         "startOrderTask",
         "采集任务",
         "导出/本地文件",
-        "导入订单",
+        "导入数据",
         "生成报告",
     )
     for fragment in expected_fragments:
@@ -230,9 +236,37 @@ def test_root_html_marks_local_export_entry_frontend_pending() -> None:
         "本地导出复跑",
         "local_export",
         "source_dir",
+        "localExportTypes",
+        "自动识别导出文件",
+        "capabilitiesPanel",
+        "/capabilities",
+        "模块能力",
+        "校验本地导出文件",
+        "/tasks/local-export/check",
+        "renderImportInspection",
+        "renderBusinessReadiness",
+        "业务能力",
+        "缺关键列",
+        "识别依据",
     )
     for fragment in expected_fragments:
         assert fragment in html, f"root HTML missing local export element: {fragment}"
+
+
+def test_capabilities_exposes_registry_without_secrets() -> None:
+    result = admin_app.capabilities()
+    assert result["status"] == "ok"
+    capabilities = {item["export_type"]: item for item in result["data"]}
+    assert capabilities["orders"]["web_enabled"] is True
+    assert capabilities["orders"]["import_enabled"] is True
+    assert capabilities["product_list"]["web_enabled"] is False
+    assert capabilities["product_list"]["import_enabled"] is True
+    assert capabilities["refunds"]["web_enabled"] is False
+    assert capabilities["refunds"]["import_enabled"] is True
+    assert capabilities["refunds"]["table_hint"] == "refunds"
+    payload = json.dumps(result, ensure_ascii=False, sort_keys=True)
+    assert "token" not in payload.lower()
+    assert "secret" not in payload.lower()
 
 
 def test_task_check_accepts_only_supported_order_export() -> None:
@@ -275,11 +309,152 @@ def test_task_check_accepts_only_supported_order_export() -> None:
     assert valid_result["data"]["shop_id"] == SHOP_ID
     assert valid_result["data"]["types"] == ["orders"]
     assert invalid_result["status"] == "error"
-    assert "只开放 orders" in invalid_result["message"]
+    assert "未开放的模块" in invalid_result["message"]
     assert mixed_invalid_result["status"] == "error"
-    assert "只开放 orders" in mixed_invalid_result["message"]
+    assert "未开放的模块" in mixed_invalid_result["message"]
     assert "products" in mixed_invalid_result["message"]
     assert "reviews" in mixed_invalid_result["message"]
+
+
+def test_task_check_accepts_local_export_product_list() -> None:
+    with local_export_source_dir(export_type="product_list", table_hint="products") as source_dir:
+        result = admin_app.check_task_request(
+            admin_app.TaskRequest(
+                shop_id=SHOP_ID,
+                source_type="local_export",
+                task_name="商品列表本地导入",
+                params={
+                    "from": "2026-06-01",
+                    "to": "2026-06-03",
+                    "types": ["product_list"],
+                    "shop_name": SHOP_NAME,
+                    "source_dir": str(source_dir),
+                },
+            )
+        )
+
+    assert result["status"] == "ok"
+    assert result["data"]["source_type"] == "local_export"
+    assert result["data"]["types"] == ["product_list"]
+
+
+def test_task_check_accepts_local_export_auto() -> None:
+    with manual_product_list_source_dir(include_order_file=True) as source_dir:
+        result = admin_app.check_task_request(
+            admin_app.TaskRequest(
+                shop_id=SHOP_ID,
+                source_type="local_export",
+                task_name="自动识别本地导入",
+                params={
+                    "from": "2026-06-01",
+                    "to": "2026-06-03",
+                    "types": ["auto"],
+                    "shop_name": SHOP_NAME,
+                    "source_dir": str(source_dir),
+                },
+            )
+        )
+
+    assert result["status"] == "ok"
+    assert result["data"]["source_type"] == "local_export"
+    assert result["data"]["local_export_mode"] == "manual_export"
+    assert result["data"]["types"] == ["auto"]
+
+
+def test_local_export_deep_check_reads_files_without_starting_task() -> None:
+    with local_export_source_dir() as source_dir:
+        result = admin_app.check_local_export(
+            admin_app.TaskRequest(
+                shop_id=SHOP_ID,
+                source_type="local_export",
+                task_name="深度校验本地导出",
+                params={
+                    "from": "2026-06-01",
+                    "to": "2026-06-03",
+                    "types": ["orders"],
+                    "shop_name": SHOP_NAME,
+                    "source_dir": str(source_dir),
+                },
+            )
+        )
+
+    assert result["status"] == "ok"
+    assert result["data"]["mode"] == "check_only"
+    assert result["data"]["db_path"] is None
+    assert result["data"]["batch_counts"]["orders"] == 1
+    assert result["data"]["db_counts"] == {}
+    inspection = result["data"]["inspection"]
+    assert inspection["inspection_version"] == 1
+    assert inspection["totals"]["tables"]["orders"] == 1
+    assert inspection["source_inspections"][0]["selected_table"] == "orders"
+    assert inspection["source_inspections"][0]["status"] == "importable"
+    readiness = {item["key"]: item for item in inspection["business_readiness"]}
+    assert readiness["order_kpi"]["status"] == "supported"
+    assert readiness["product_contribution"]["status"] == "blocked"
+
+
+def test_manual_export_without_metadata_can_be_checked() -> None:
+    with manual_product_list_source_dir(include_order_file=True) as source_dir:
+        result = admin_app.check_local_export(
+            admin_app.TaskRequest(
+                shop_id=SHOP_ID,
+                source_type="local_export",
+                task_name="手动商品列表校验",
+                params={
+                    "from": "2026-06-01",
+                    "to": "2026-06-03",
+                    "types": ["product_list"],
+                    "shop_name": SHOP_NAME,
+                    "source_dir": str(source_dir),
+                },
+            )
+        )
+
+    assert result["status"] == "ok"
+    assert result["data"]["mode"] == "check_only"
+    assert result["data"]["expected_types"] == ["product_list"]
+    assert result["data"]["manifest_policy"] == "ignore"
+    assert result["data"]["batch_counts"]["orders"] == 0
+    assert result["data"]["batch_counts"]["products"] == 2
+    assert result["data"]["batch_counts"]["product_skus"] == 2
+    assert result["data"]["db_counts"] == {}
+    source_inspections = result["data"]["inspection"]["source_inspections"]
+    product_inspection = next(item for item in source_inspections if item["selected_table"] == "products")
+    assert product_inspection["row_counts"]["derived_tables"] == {"product_skus": 2}
+    assert any(field["field"] == "product_name" for field in product_inspection["field_matches"])
+    warning_codes = {warning.get("code") for warning in result["data"]["warnings"]}
+    assert "unexpected_table_for_expected_types" in warning_codes
+
+
+def test_manual_export_auto_detects_mixed_tables() -> None:
+    with manual_product_list_source_dir(include_order_file=True) as source_dir:
+        result = admin_app.check_local_export(
+            admin_app.TaskRequest(
+                shop_id=SHOP_ID,
+                source_type="local_export",
+                task_name="手动目录自动识别",
+                params={
+                    "from": "2026-06-01",
+                    "to": "2026-06-03",
+                    "types": ["auto"],
+                    "shop_name": SHOP_NAME,
+                    "source_dir": str(source_dir),
+                },
+            )
+        )
+
+    assert result["status"] == "ok"
+    assert result["data"]["mode"] == "check_only"
+    assert result["data"]["expected_types"] == []
+    assert result["data"]["manifest_policy"] == "ignore"
+    assert result["data"]["batch_counts"]["orders"] == 1
+    assert result["data"]["batch_counts"]["products"] == 2
+    assert result["data"]["batch_counts"]["product_skus"] == 2
+    readiness = {item["key"]: item for item in result["data"]["inspection"]["business_readiness"]}
+    assert readiness["order_kpi"]["status"] == "supported"
+    assert readiness["product_profile"]["status"] == "supported"
+    warning_codes = {warning.get("code") for warning in result["data"]["warnings"]}
+    assert "unexpected_table_for_expected_types" not in warning_codes
 
 
 def test_task_check_accepts_source_type_local_export() -> None:
@@ -374,7 +549,9 @@ class patched_env_file:
 
 
 class local_export_source_dir:
-    def __init__(self) -> None:
+    def __init__(self, export_type: str = "orders", table_hint: str = "orders") -> None:
+        self.export_type = export_type
+        self.table_hint = table_hint
         local_export_root = admin_app.PROJECT_ROOT / "data" / "raw"
         local_export_root.mkdir(parents=True, exist_ok=True)
         self.temp_dir_context = tempfile.TemporaryDirectory(
@@ -384,8 +561,8 @@ class local_export_source_dir:
         self.source_dir = Path(self.temp_dir_context.name)
 
     def __enter__(self) -> Path:
-        orders_path = self.source_dir / "orders.csv"
-        orders_path.write_text(
+        export_path = self.source_dir / f"{self.export_type}.csv"
+        export_path.write_text(
             "\n".join(
                 [
                     "订单号,下单时间,订单状态,支付金额",
@@ -398,14 +575,14 @@ class local_export_source_dir:
         artifact = {
             "source_kind": "export_file",
             "source_type": "export_file",
-            "export_type": "orders",
-            "table_hint": "orders",
-            "saved_path": orders_path.name,
-            "original_filename": orders_path.name,
+            "export_type": self.export_type,
+            "table_hint": self.table_hint,
+            "saved_path": export_path.name,
+            "original_filename": export_path.name,
             "shop_id": SHOP_ID,
             "shop_name": SHOP_NAME,
             "status": "completed",
-            "size_bytes": orders_path.stat().st_size,
+            "size_bytes": export_path.stat().st_size,
         }
         manifest = {
             "task_id": "local-export-rerun-regression",
@@ -428,6 +605,48 @@ class local_export_source_dir:
             json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+        return self.source_dir
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.temp_dir_context.cleanup()
+
+
+class manual_product_list_source_dir:
+    def __init__(self, include_order_file: bool = False) -> None:
+        self.include_order_file = include_order_file
+        local_export_root = admin_app.PROJECT_ROOT / "data" / "raw"
+        local_export_root.mkdir(parents=True, exist_ok=True)
+        self.temp_dir_context = tempfile.TemporaryDirectory(
+            prefix="manual_product_list_2026-06-01_2026-06-03_",
+            dir=local_export_root,
+        )
+        self.source_dir = Path(self.temp_dir_context.name)
+
+    def __enter__(self) -> Path:
+        export_path = self.source_dir / "导出商品.csv"
+        export_path.write_text(
+            "\n".join(
+                [
+                    "商品ID,商品名称,SKU ID,规格名称,销售价,可售库存,商品类目,上下架状态,商家编码",
+                    "p-001,夏季连衣裙,sku-001,M码,129.00,20,女装,销售中,B001",
+                    "p-001,夏季连衣裙,sku-002,L码,129.00,12,女装,销售中,B002",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        if self.include_order_file:
+            order_path = self.source_dir / "orders.csv"
+            order_path.write_text(
+                "\n".join(
+                    [
+                        "订单号,下单时间,订单状态,支付金额",
+                        "order-001,2026-06-01 10:00:00,已完成,12.30",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
         return self.source_dir
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:

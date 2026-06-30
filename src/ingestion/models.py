@@ -8,6 +8,7 @@ from shared.table_catalog import ALL_BATCH_TABLES, METADATA_TABLES, STANDARD_TAB
 
 Record = dict[str, Any]
 WarningRecord = dict[str, Any]
+InspectionRecord = dict[str, Any]
 
 
 @dataclass
@@ -31,6 +32,7 @@ class ImportBatch:
     collection_tasks: list[Record] = field(default_factory=list)
     collection_task_items: list[Record] = field(default_factory=list)
     warnings: list[WarningRecord] = field(default_factory=list)
+    inspections: list[InspectionRecord] = field(default_factory=list)
 
     def extend_table(self, table: str, records: list[Record]) -> None:
         if table not in ALL_BATCH_TABLES:
@@ -41,3 +43,23 @@ class ImportBatch:
         counts = {table: len(getattr(self, table)) for table in ALL_BATCH_TABLES}
         counts["warnings"] = len(self.warnings)
         return counts
+
+    def inspection_summary(self, source_dir: str | None = None) -> dict[str, Any]:
+        counts = self.counts()
+        table_counts = {
+            table: count
+            for table, count in counts.items()
+            if table in STANDARD_TABLES and count > 0
+        }
+        source_inspections = [dict(inspection) for inspection in self.inspections]
+        return {
+            "inspection_version": 1,
+            "source_dir": source_dir,
+            "totals": {
+                "files": len({inspection.get("source_file") for inspection in source_inspections if inspection.get("source_file")}),
+                "sheets": len(source_inspections),
+                "tables": table_counts,
+                "warnings": counts.get("warnings", 0),
+            },
+            "source_inspections": source_inspections,
+        }

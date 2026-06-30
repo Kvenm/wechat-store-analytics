@@ -48,7 +48,7 @@ def generate_report(
     _write_summary_csv(summary_csv_path, metrics)
     _write_product_csv(product_csv_path, metrics)
     _write_audience_csv(audience_csv_path, metrics)
-    _write_decisions_csv(decisions_csv_path, metrics)
+    _write_decisions_csv(decisions_csv_path, metrics, warnings)
 
     report_id = create_strategy_report(
         conn,
@@ -89,6 +89,7 @@ def _render_markdown(run: dict[str, Any], metrics: dict[str, Any], warnings: lis
         f"- 分析周期：`{date_from}` 至 `{date_to}`",
         f"- 生成时间：`{run['created_at']}`",
         f"- 数据覆盖：`{_coverage_label(data_coverage)}`",
+        f"- 指标口径：{_metric_scope_text(data_coverage)}",
         "",
         "## 核心指标",
         "",
@@ -108,6 +109,8 @@ def _render_markdown(run: dict[str, Any], metrics: dict[str, Any], warnings: lis
         "",
     ]
     lines.extend(_data_coverage_lines(data_coverage))
+    lines.extend(["", "## 数据缺口与决策限制", ""])
+    lines.extend(_decision_limitation_lines(metrics, warnings))
     lines.extend([
         "",
         "## 店铺日概览",
@@ -330,6 +333,147 @@ def _business_decision_lines(metrics: dict[str, Any], warnings: list[dict[str, A
         )
     )
     return lines
+
+
+def _decision_limitation_lines(metrics: dict[str, Any], warnings: list[dict[str, Any]]) -> list[str]:
+    limitations = _decision_limitations(metrics, warnings)
+    if not limitations:
+        return ["- 当前未识别到阻断性数据缺口；涉及价格、毛利、库存和履约的动作仍需人工复核。"]
+    lines = [
+        "| 决策项 | 当前状态 | 还能做什么 | 不能直接做什么 | 需要补充的数据 |",
+        "|---|---|---|---|---|",
+    ]
+    for item in limitations:
+        lines.append(
+            "| {decision} | {status} | {allowed} | {blocked} | {needed} |".format(
+                decision=_escape_table_cell(item["decision"]),
+                status=_escape_table_cell(item["status"]),
+                allowed=_escape_table_cell(item["allowed"]),
+                blocked=_escape_table_cell(item["blocked"]),
+                needed=_escape_table_cell(item["needed"]),
+            )
+        )
+    return lines
+
+
+def _decision_limitations(metrics: dict[str, Any], warnings: list[dict[str, Any]]) -> list[dict[str, str]]:
+    order_metrics = metrics.get("order_metrics", {})
+    shop_daily_metrics = metrics.get("shop_daily_metrics", {})
+    product_metrics = metrics.get("product_metrics", [])
+    audience_metrics = metrics.get("audience_metrics", {})
+    data_coverage = metrics.get("data_coverage", {})
+    warning_codes = {str(warning.get("code") or "") for warning in warnings}
+
+    limitations: list[dict[str, str]] = []
+    decision_level = str(data_coverage.get("decision_level") or "")
+    coverage_status = _coverage_label(data_coverage)
+    effective_orders = _as_float(order_metrics.get("effective_order_count"))
+    order_items = _as_float(data_coverage.get("order_item_count"))
+    refunds = _as_float(data_coverage.get("refund_count"))
+    has_shop_daily = bool(shop_daily_metrics.get("row_count"))
+    has_product_sample = _has_product_decision_sample(product_metrics)
+    has_audience = bool(audience_metrics.get("segment_count"))
+    has_warnings = bool(warning_codes)
+
+    if decision_level in {"insufficient", "shop_summary_only", "order_only"} or not product_metrics:
+        limitations.append(
+            {
+                "decision": "具体商品加推/暂停",
+                "status": f"受限：{coverage_status}",
+                "allowed": "可做店铺级订单、退款、GMV 复盘" if effective_orders or has_shop_daily else "只能确认当前数据不足",
+                "blocked": "不能把某个商品直接定为加推、下架或暂停放量对象",
+                "needed": "订单全部导出、订单商品明细、退款/售后明细、商品列表",
+            }
+        )
+    elif not has_product_sample:
+        limitations.append(
+            {
+                "decision": "具体商品加推/暂停",
+                "status": f"受限：商品样本低于 {MIN_PRODUCT_ORDER_COUNT_FOR_DECISION} 单阈值",
+                "allowed": "可做小预算验证和自然流量观察",
+                "blocked": "不能直接大额放量或下架",
+                "needed": "更长周期订单、商品明细、退款明细",
+            }
+        )
+
+    if refunds == 0 and (
+        _as_float(order_metrics.get("refund_order_count")) == 0
+        or "refund_detail_coverage_mismatch" in warning_codes
+    ):
+        limitations.append(
+            {
+                "decision": "退款/售后归因",
+                "status": "受限：缺少独立退款/售后明细",
+                "allowed": "可用订单聚合退款金额做风险提醒",
+                "blocked": "不能判断退款原因、责任环节或售后优化优先级",
+                "needed": "退款/退货导出、售后原因、评价差评内容",
+            }
+        )
+
+    if not has_audience:
+        limitations.append(
+            {
+                "decision": "人群定向",
+                "status": "受限：缺少人群/罗盘明细",
+                "allowed": "可按已有商品与订单表现做粗略假设",
+                "blocked": "不能直接锁定年龄、性别、地域、消费层级等投放定向",
+                "needed": "人群数据、流量来源、商品访客和成交人群",
+            }
+        )
+
+    if not has_shop_daily:
+        limitations.append(
+            {
+                "decision": "详情页/素材承接",
+                "status": "受限：缺少曝光、点击、成交趋势",
+                "allowed": "可从订单和退款侧提出需要复核的方向",
+                "blocked": "不能判断是主图标题问题、详情页转化问题还是流量质量问题",
+                "needed": "店铺日概览、商品曝光、点击、转化、流量来源",
+            }
+        )
+
+    limitations.append(
+        {
+            "decision": "价格/利润/库存",
+            "status": "受限：系统未采集毛利、成本、库存周转和竞品价格",
+            "allowed": "可根据客单价和退款风险提示价格需复核",
+            "blocked": "不能直接给出涨价、降价、清仓或补货结论",
+            "needed": "商品成本、毛利、库存、活动价、竞品价格、库存可售天数",
+        }
+    )
+
+    if has_warnings:
+        limitations.append(
+            {
+                "decision": "所有经营动作",
+                "status": f"受限：存在 {_warning_codes(warnings)}",
+                "allowed": "可按当前聚合结果做初步排查",
+                "blocked": "不能把本次结论视为最终投放或下架依据",
+                "needed": "修正 warning 对应字段后重新导入和分析",
+            }
+        )
+
+    deduped: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in limitations:
+        key = (item["decision"], item["status"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _metric_scope_text(data_coverage: dict[str, Any]) -> str:
+    if not data_coverage:
+        return "核心指标仅基于已导入数据；缺失订单/退款明细时，0 不代表真实为 0。"
+    decision_level = str(data_coverage.get("decision_level") or "")
+    status = str(data_coverage.get("status") or "")
+    if decision_level in {"insufficient", "shop_summary_only"} or status in {"missing_order_detail", "no_order_signal"}:
+        return "核心指标仅基于已导入数据；缺失订单/退款明细时，0 不代表真实为 0。"
+    if status in {"partial_order_detail", "orders_without_items"}:
+        return "核心指标仅基于已导入订单样本；商品、退款和投放结论需要补齐后复算。"
+    return "核心指标基于当前已导入订单、退款、商品和店铺日数据；仍需结合库存、毛利、履约人工复核。"
 
 
 def _decision_boundary_lines(
@@ -722,9 +866,31 @@ def _write_audience_csv(path: Path, metrics: dict[str, Any]) -> None:
             writer.writerow({field: row.get(field) for field in fieldnames})
 
 
-def _write_decisions_csv(path: Path, metrics: dict[str, Any]) -> None:
-    decisions = metrics.get("decision_metrics", {}).get("decisions", [])
-    fieldnames = ("action", "target", "priority", "confidence", "basis")
+def _write_decisions_csv(path: Path, metrics: dict[str, Any], warnings: list[dict[str, Any]] | None = None) -> None:
+    decisions = list(metrics.get("decision_metrics", {}).get("decisions", []))
+    decisions.extend(
+        {
+            "action": "决策限制",
+            "target": item["decision"],
+            "priority": "high" if str(item["status"]).startswith("受限") else "medium",
+            "confidence": "high",
+            "basis": f"{item['status']}；不能直接做：{item['blocked']}；需补充：{item['needed']}",
+            "decision_allowed": item["allowed"],
+            "blocked_reason": item["blocked"],
+            "required_missing_data": item["needed"],
+        }
+        for item in _decision_limitations(metrics, warnings or [])
+    )
+    fieldnames = (
+        "action",
+        "target",
+        "priority",
+        "confidence",
+        "basis",
+        "decision_allowed",
+        "blocked_reason",
+        "required_missing_data",
+    )
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()

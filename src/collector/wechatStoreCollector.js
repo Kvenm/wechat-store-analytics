@@ -9,6 +9,7 @@ import { safePathSegment } from '../shared/nodePaths.js';
 export const STORE_URL = 'https://store.weixin.qq.com/';
 export const DEFAULT_EXPORT_TYPES = [
   'transactions',
+  'product_list',
   'products',
   'audience',
   'compass',
@@ -43,6 +44,7 @@ const DEFAULT_TABLE_HINT_BY_EXPORT_TYPE = {
   compass: 'audience_insights',
   funds: 'fund_flows',
   orders: 'orders',
+  product_list: 'products',
   products: 'products',
   repurchase: 'shop_daily',
   reviews: 'reviews',
@@ -66,6 +68,16 @@ const DEFAULT_EXPORT_DEFINITIONS = {
     selectors: {
       pageReady: 'TODO_SELECTOR_ORDERS_PAGE_READY',
       exportButton: 'TODO_SELECTOR_ORDERS_EXPORT_BUTTON'
+    }
+  },
+  product_list: {
+    label: 'Product list export',
+    tableHint: 'products',
+    path: 'TODO_PATH_PRODUCT_LIST_EXPORT_PAGE',
+    expectedFormats: ['xlsx', 'csv'],
+    selectors: {
+      pageReady: 'TODO_SELECTOR_PRODUCT_LIST_PAGE_READY',
+      exportButton: 'TODO_SELECTOR_PRODUCT_LIST_EXPORT_BUTTON'
     }
   },
   products: {

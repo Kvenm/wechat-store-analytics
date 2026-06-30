@@ -11,13 +11,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
+from shared.module_registry import get_module_capability, import_enabled_types, unsupported_types_message, web_enabled_types
 from shared.paths import DEFAULT_DB_PATH, DEFAULT_REPORTS_DIR, DEFAULT_STANDARD_DIR, PROJECT_ROOT
 from warehouse.repository import connect, initialize_database, upsert_api_task_run, upsert_api_task_step
 
 
 STEP_KEYS = ("collect", "import_metadata", "import_files", "analyze", "report")
 RUNNING_STATES = {"queued", "running"}
-SUPPORTED_WEB_EXPORT_TYPES = {"orders"}
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 TASK_OUTPUT_TAIL_LENGTH = 8000
 RAW_EXPORT_DIR = PROJECT_ROOT / "data" / "raw"
@@ -54,6 +54,34 @@ def start_web_export_task(payload: Mapping[str, Any]) -> dict[str, Any]:
         return _public_task(task)
 
 
+def check_local_export_files(payload: Mapping[str, Any]) -> dict[str, Any]:
+    spec = normalize_web_export_payload(payload)
+    if spec.get("source_type") != "local_export":
+        raise TaskRunnerError("深度文件校验只支持 source_type=local_export 或 params.mode=local_export。")
+
+    collection_task_id = _local_export_collection_task_id(spec)
+    return _run_command_for_json(
+        [
+            sys.executable,
+            "scripts/import/import_files.py",
+            "--source-dir",
+            spec["source_dir"],
+            "--shop-id",
+            spec["shop_id"],
+            "--shop-name",
+            spec["shop_name"],
+            "--task-id",
+            collection_task_id,
+            "--expected-types",
+            ",".join(str(item) for item in spec.get("types") or []),
+            "--manifest-policy",
+            "ignore" if spec.get("local_export_mode") == "manual_export" else "auto",
+            "--check-only",
+        ],
+        step_key="local_export_check",
+    )
+
+
 def list_runtime_tasks() -> list[dict[str, Any]]:
     with _lock:
         return sorted(
@@ -88,11 +116,11 @@ def normalize_web_export_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     _validate_date_range(date_from, date_to)
 
     requested_types = _normalize_types(params.get("types") or ["orders"])
-    unsupported = [item for item in requested_types if item not in SUPPORTED_WEB_EXPORT_TYPES]
+    unsupported = [item for item in requested_types if item not in web_enabled_types()]
     if unsupported:
         raise TaskRunnerError(
-            "本轮页面真实采集只开放 orders，暂不启动未校准模块："
-            + "、".join(unsupported)
+            "本轮页面真实采集只开放已校准模块，暂不启动未校准模块。"
+            + unsupported_types_message(unsupported, mode="web")
         )
 
     shop_id = _text(payload.get("shop_id") or params.get("shop_id"))
@@ -143,7 +171,7 @@ def _normalize_local_export_payload(
             payload.get("source_dir"),
         )
     )
-    metadata = _read_json(metadata_path)
+    metadata = _read_json(metadata_path) if metadata_path is not None else {}
 
     shop_id = _first_text(
         payload.get("shop_id"),
@@ -161,11 +189,13 @@ def _normalize_local_export_payload(
         params.get("from"),
         params.get("date_from"),
         _metadata_date_value(metadata, "from"),
+        _date_from_source_dir(source_dir, "from"),
     )
     date_to = _first_text(
         params.get("to"),
         params.get("date_to"),
         _metadata_date_value(metadata, "to"),
+        _date_from_source_dir(source_dir, "to"),
     )
 
     _require_local_export_field("shop_id", shop_id, source_dir, "params.shop_id 或 metadata.shop_id")
@@ -182,6 +212,16 @@ def _normalize_local_export_payload(
     requested_types = _normalize_types(
         params.get("types") or metadata.get("types") or _metadata_export_types(metadata) or ["orders"]
     )
+    auto_detect = _is_auto_types(requested_types)
+    unsupported = [
+        item for item in requested_types
+        if item not in import_enabled_types() and item.lower() != "auto"
+    ]
+    if unsupported:
+        raise TaskRunnerError(
+            "本地导出模式只允许导入已登记的数据模块。"
+            + unsupported_types_message(unsupported, mode="import")
+        )
     task_name = _text(payload.get("task_name")) or f"本地导出分析 {date_from} 至 {date_to}"
 
     return {
@@ -190,12 +230,20 @@ def _normalize_local_export_payload(
         "task_name": task_name,
         "source_type": "local_export",
         "mode": "local_export",
+        "local_export_mode": "collector_export" if metadata_path is not None else "manual_export",
         "from": date_from,
         "to": date_to,
-        "types": requested_types,
+        "types": ["auto"] if auto_detect else requested_types,
         "headless": False,
         "source_dir": str(source_dir),
-        "metadata_path": str(metadata_path),
+        "metadata_path": str(metadata_path) if metadata_path is not None else None,
+        "collection_task_id": _text(metadata.get("task_id")) or _manual_export_task_id(
+            source_dir=source_dir,
+            shop_id=shop_id,
+            date_from=date_from,
+            date_to=date_to,
+            requested_types=requested_types,
+        ),
     }
 
 
@@ -260,6 +308,10 @@ def _run_task(task_id: str) -> None:
                 collection_task_id,
                 "--standard-dir",
                 str(standard_dir),
+                "--expected-types",
+                ",".join(str(item) for item in spec.get("types") or []),
+                "--manifest-policy",
+                "ignore" if spec.get("local_export_mode") == "manual_export" else "auto",
             ],
         )
 
@@ -316,9 +368,9 @@ def _run_task(task_id: str) -> None:
 
 def _prepare_task_source(task_id: str, spec: Mapping[str, Any]) -> tuple[Path, dict[str, Any]]:
     if spec.get("source_type") == "local_export":
-        metadata_path = Path(str(spec["metadata_path"]))
+        metadata_path = _ensure_local_export_metadata(spec)
         metadata = _read_json(metadata_path)
-        collection_task_id = _text(metadata.get("task_id")) or metadata_path.parent.name
+        collection_task_id = _text(metadata.get("task_id")) or _text(spec.get("collection_task_id")) or metadata_path.parent.name
         _set_step(
             task_id,
             "collect",
@@ -327,6 +379,7 @@ def _prepare_task_source(task_id: str, spec: Mapping[str, Any]) -> tuple[Path, d
             completed_at=_now(),
             parsed={
                 "mode": "local_export",
+                "local_export_mode": spec.get("local_export_mode"),
                 "message": "已跳过在线采集，使用 data/raw 下的本地导出目录。",
                 "source_dir": str(metadata_path.parent),
                 "metadata_path": str(metadata_path),
@@ -424,6 +477,28 @@ def _run_step(
         parsed=parsed,
     )
     return parsed
+
+
+def _run_command_for_json(command: list[str], *, step_key: str) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(PROJECT_ROOT),
+            env=_subprocess_env(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise TaskRunnerError(f"{step_key} 启动失败：{exc}") from exc
+
+    if completed.returncode != 0:
+        stderr_tail = _tail(completed.stderr)
+        raise TaskRunnerError(
+            f"{step_key} 执行失败，exit_code={completed.returncode}。"
+            f"{(' stderr: ' + stderr_tail) if stderr_tail else ''}"
+        )
+    return _parse_json_stdout(completed.stdout, step_key)
 
 
 def _build_runtime_task(spec: dict[str, Any]) -> dict[str, Any]:
@@ -616,7 +691,140 @@ def _find_latest_metadata_path(*, shop_id: str, date_from: str, date_to: str, st
     return sorted(candidates, key=lambda item: item[0], reverse=True)[0][1]
 
 
-def _resolve_local_export_source_dir(value: str | None) -> tuple[Path, Path]:
+def _ensure_local_export_metadata(spec: Mapping[str, Any]) -> Path:
+    metadata_path_value = _text(spec.get("metadata_path"))
+    if metadata_path_value:
+        return Path(metadata_path_value)
+
+    source_dir = Path(str(spec["source_dir"]))
+    metadata_path = source_dir / "task-metadata.json"
+    if metadata_path.exists():
+        return metadata_path
+
+    metadata = _manual_export_metadata(spec, metadata_path)
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    return metadata_path
+
+
+def _manual_export_metadata(spec: Mapping[str, Any], metadata_path: Path) -> dict[str, Any]:
+    collection_task_id = _local_export_collection_task_id(spec)
+    artifacts = _manual_export_artifacts(
+        source_dir=metadata_path.parent,
+        shop_id=str(spec["shop_id"]),
+        shop_name=str(spec["shop_name"]),
+        requested_types=[str(item) for item in spec.get("types") or []],
+    )
+    return {
+        "task_id": collection_task_id,
+        "status": "completed",
+        "source_type": "manual_export",
+        "shop_id": spec["shop_id"],
+        "shop_name": spec["shop_name"],
+        "date_range": {"from": spec["from"], "to": spec["to"]},
+        "types": list(spec.get("types") or []),
+        "artifacts": artifacts,
+        "items": [
+            {
+                "shop_id": spec["shop_id"],
+                "shop_name": spec["shop_name"],
+                "type": artifact.get("export_type"),
+                "label": artifact.get("export_type"),
+                "status": "completed",
+                "export": artifact,
+                "error": None,
+            }
+            for artifact in artifacts
+        ],
+        "created_at": _now(),
+    }
+
+
+def _manual_export_artifacts(
+    *,
+    source_dir: Path,
+    shop_id: str,
+    shop_name: str,
+    requested_types: list[str],
+) -> list[dict[str, Any]]:
+    files = [
+        path
+        for path in sorted(source_dir.rglob("*"))
+        if path.is_file()
+        and path.suffix.lower() in {".csv", ".xlsx", ".xls", ".zip"}
+        and path.name not in {"task-metadata.json", "artifacts-manifest.json"}
+        and not path.name.startswith("~$")
+    ]
+    if not files:
+        return []
+
+    export_type = requested_types[0] if len(requested_types) == 1 and requested_types[0] != "auto" else None
+    artifacts: list[dict[str, Any]] = []
+    for path in files:
+        relative_path = path.relative_to(source_dir)
+        artifact: dict[str, Any] = {
+            "source_kind": "export_file",
+            "source_type": "export_file",
+            "saved_path": str(relative_path),
+            "original_filename": path.name,
+            "shop_id": shop_id,
+            "shop_name": shop_name,
+            "status": "completed",
+            "size_bytes": path.stat().st_size,
+        }
+        if export_type:
+            artifact["export_type"] = export_type
+            capability = get_module_capability(export_type)
+            if capability is not None:
+                artifact["table_hint"] = capability.table_hint
+        artifacts.append(artifact)
+    return artifacts
+
+
+def _local_export_collection_task_id(spec: Mapping[str, Any]) -> str:
+    metadata_path_value = _text(spec.get("metadata_path"))
+    if metadata_path_value:
+        metadata = _read_json(Path(metadata_path_value))
+        return _text(metadata.get("task_id")) or Path(metadata_path_value).parent.name
+    return _manual_export_task_id(
+        source_dir=Path(str(spec["source_dir"])),
+        shop_id=str(spec["shop_id"]),
+        date_from=str(spec["from"]),
+        date_to=str(spec["to"]),
+        requested_types=[str(item) for item in spec.get("types") or []],
+    )
+
+
+def _manual_export_task_id(
+    *,
+    source_dir: Path,
+    shop_id: str,
+    date_from: str,
+    date_to: str,
+    requested_types: list[str],
+) -> str:
+    type_segment = "-".join(_safe_path_segment(item) for item in requested_types) or "manual"
+    return "_".join(
+        [
+            "manual_export",
+            _safe_path_segment(shop_id),
+            date_from,
+            date_to,
+            type_segment,
+            _safe_path_segment(source_dir.name),
+        ]
+    )
+
+
+def _date_from_source_dir(source_dir: Path, key: str) -> str | None:
+    matches = re.findall(r"\d{4}-\d{2}-\d{2}", source_dir.name)
+    if key == "from" and matches:
+        return matches[0]
+    if key == "to" and matches:
+        return matches[-1]
+    return None
+
+
+def _resolve_local_export_source_dir(value: str | None) -> tuple[Path, Path | None]:
     if not value:
         raise TaskRunnerError("本地导出模式需要提供 params.source_dir。")
 
@@ -635,9 +843,7 @@ def _resolve_local_export_source_dir(value: str | None) -> tuple[Path, Path]:
         raise TaskRunnerError(f"本地导出 source_dir 必须位于项目 data/raw 下：{resolved_source_dir}")
 
     metadata_path = resolved_source_dir / "task-metadata.json"
-    if not metadata_path.is_file():
-        raise TaskRunnerError(f"本地导出目录缺少 task-metadata.json：{metadata_path}")
-    return resolved_source_dir, metadata_path
+    return resolved_source_dir, metadata_path if metadata_path.is_file() else None
 
 
 def _metadata_date_value(metadata: Mapping[str, Any], key: str) -> str | None:
@@ -781,6 +987,10 @@ def _normalize_types(value: Any) -> list[str]:
     if not normalized:
         raise TaskRunnerError("至少需要选择一个采集类型。")
     return list(dict.fromkeys(normalized))
+
+
+def _is_auto_types(types: list[str]) -> bool:
+    return any(item.lower() == "auto" for item in types)
 
 
 def _subprocess_env() -> dict[str, str]:

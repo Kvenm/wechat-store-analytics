@@ -8,11 +8,11 @@ from typing import Mapping, Sequence
 from ingestion.models import ALL_BATCH_TABLES, STANDARD_TABLES, ImportBatch
 from ingestion.normalizer import guess_table_for_frame, normalize_frame
 from ingestion.readers import ArtifactMatch, iter_source_files, load_artifact_manifest_index, read_workbook_tables
-from shared.field_mapping import load_custom_field_map, match_fields
+from shared.field_mapping import load_custom_field_map, match_fields, match_fields_detail
 from shared.ids import fingerprint, stable_json
 from shared.parsing import clean_cell, to_float, to_iso_datetime, to_text
 from shared.paths import ensure_dir
-from shared.table_catalog import table_for_export_type
+from shared.table_catalog import required_fields_for_table, table_for_export_type
 
 
 def build_import_batch(
@@ -22,9 +22,12 @@ def build_import_batch(
     task_id: str | None,
     shop_name: str | None = None,
     field_map_path: str | Path | None = None,
+    expected_types: Sequence[str] | None = None,
+    manifest_policy: str = "auto",
 ) -> ImportBatch:
     custom_map = load_custom_field_map(field_map_path)
     batch = ImportBatch(shop_id=shop_id, task_id=task_id, shop_name=shop_name)
+    allowed_tables = _allowed_tables_for_expected_types(expected_types)
     files = iter_source_files(source_dir)
     if not files:
         batch.warnings.append(
@@ -36,7 +39,14 @@ def build_import_batch(
         )
         return batch
 
-    manifest_index, manifest_warnings = load_artifact_manifest_index(source_dir)
+    if manifest_policy not in {"auto", "ignore"}:
+        raise ValueError(f"Unsupported manifest_policy: {manifest_policy}")
+
+    manifest_index, manifest_warnings = (
+        (None, [])
+        if manifest_policy == "ignore"
+        else load_artifact_manifest_index(source_dir)
+    )
     batch.warnings.extend(manifest_warnings)
     has_manifest_without_importable_artifacts = bool(manifest_warnings) and any(
         str(warning.get("code", "")).startswith(("invalid_", "unsupported_", "artifact_"))
@@ -92,6 +102,15 @@ def build_import_batch(
             )
             table = guessed_table
             source_file = str(path)
+            inspection = _base_source_inspection(
+                frame,
+                source_file=source_file,
+                source_sheet=sheet_name,
+                guessed_table=guessed_table,
+                scores=scores,
+            )
+            selected_reason = "heuristic" if guessed_table else "unrecognized"
+            inspection_warnings: list[dict[str, object]] = []
             if artifact_match:
                 table, table_warnings, skip_sheet = _table_from_artifact_hint(
                     artifact_match=artifact_match,
@@ -101,18 +120,62 @@ def build_import_batch(
                     source_sheet=sheet_name,
                 )
                 batch.warnings.extend(table_warnings)
+                inspection_warnings.extend(table_warnings)
+                selected_reason = _selected_reason_from_warnings(table_warnings, fallback=selected_reason)
                 if skip_sheet:
+                    inspection.update(
+                        {
+                            "status": "skipped",
+                            "selected_table": table or "",
+                            "selected_reason": selected_reason,
+                            "skip_reason": "table_hint_conflict",
+                            "warnings": _compact_warnings(table_warnings),
+                        }
+                    )
+                    batch.inspections.append(inspection)
                     continue
             if table is None:
-                batch.warnings.append(
+                warning = {
+                    "code": "unknown_table",
+                    "source_file": source_file,
+                    "source_sheet": sheet_name or "",
+                    "scores_json": json.dumps(scores, ensure_ascii=False),
+                    "message": "无法识别文件类型，未导入该表",
+                }
+                batch.warnings.append(warning)
+                inspection.update(
                     {
-                        "code": "unknown_table",
-                        "source_file": source_file,
-                        "source_sheet": sheet_name or "",
-                        "scores_json": json.dumps(scores, ensure_ascii=False),
-                        "message": "无法识别文件类型，未导入该表",
+                        "status": "unrecognized",
+                        "selected_table": "",
+                        "selected_reason": selected_reason,
+                        "skip_reason": "unknown_table",
+                        "warnings": _compact_warnings([warning]),
                     }
                 )
+                batch.inspections.append(inspection)
+                continue
+            _apply_field_inspection(inspection, table, custom_map)
+            if allowed_tables is not None and table not in allowed_tables:
+                warning = {
+                    "code": "unexpected_table_for_expected_types",
+                    "source_file": source_file,
+                    "source_sheet": sheet_name or "",
+                    "table": table,
+                    "expected_types_json": json.dumps(list(expected_types or ()), ensure_ascii=False),
+                    "allowed_tables_json": json.dumps(sorted(allowed_tables), ensure_ascii=False),
+                    "message": "文件表头识别出的标准表不在本次选择的导入类型范围内，已跳过",
+                }
+                batch.warnings.append(warning)
+                inspection.update(
+                    {
+                        "status": "skipped",
+                        "selected_table": table,
+                        "selected_reason": selected_reason,
+                        "skip_reason": "unexpected_table_for_expected_types",
+                        "warnings": _compact_warnings([warning]),
+                    }
+                )
+                batch.inspections.append(inspection)
                 continue
             records, warnings = normalize_frame(
                 frame,
@@ -129,6 +192,8 @@ def build_import_batch(
                 warnings.extend(dedupe_warnings)
             batch.extend_table(table, records)
             batch.warnings.extend(warnings)
+            derived_counts: dict[str, int] = {}
+            source_warnings = [*inspection_warnings, *warnings]
             if table == "orders":
                 derived_records, derived_warnings = derive_order_related_records(
                     frame,
@@ -141,8 +206,191 @@ def build_import_batch(
                 )
                 for derived_table, derived_rows in derived_records.items():
                     batch.extend_table(derived_table, derived_rows)
+                    if derived_rows:
+                        derived_counts[derived_table] = len(derived_rows)
                 batch.warnings.extend(derived_warnings)
+                source_warnings.extend(derived_warnings)
+            if table == "products":
+                sku_records, sku_warnings = derive_product_sku_records(
+                    frame,
+                    shop_id=shop_id,
+                    shop_name=shop_name,
+                    task_id=task_id,
+                    source_file=source_file,
+                    source_sheet=sheet_name,
+                    custom_map=custom_map,
+                )
+                batch.extend_table("product_skus", sku_records)
+                if sku_records:
+                    derived_counts["product_skus"] = len(sku_records)
+                batch.warnings.extend(sku_warnings)
+                source_warnings.extend(sku_warnings)
+            row_counts = dict(inspection.get("row_counts") or {})
+            row_counts["imported_rows"] = len(records)
+            row_counts["derived_tables"] = derived_counts
+            inspection.update(
+                {
+                    "status": _inspection_status(records, inspection, source_warnings, derived_counts),
+                    "selected_table": table,
+                    "selected_reason": selected_reason,
+                    "row_counts": row_counts,
+                    "missing_required_values": _missing_required_value_counts(source_warnings),
+                    "warnings": _compact_warnings(source_warnings),
+                }
+            )
+            batch.inspections.append(inspection)
     return batch
+
+
+def _allowed_tables_for_expected_types(expected_types: Sequence[str] | None) -> set[str] | None:
+    normalized = [str(item).strip() for item in expected_types or () if str(item).strip()]
+    if not normalized:
+        return None
+    if any(item.lower() == "auto" for item in normalized):
+        return None
+
+    allowed: set[str] = set()
+    for export_type in normalized:
+        table = table_for_export_type(export_type)
+        allowed.add(table)
+        if table == "orders":
+            allowed.update({"order_items", "refunds"})
+        elif table == "products":
+            allowed.add("product_skus")
+    return allowed
+
+
+def _base_source_inspection(
+    frame,
+    *,
+    source_file: str,
+    source_sheet: str | None,
+    guessed_table: str | None,
+    scores: Mapping[str, int],
+) -> dict[str, object]:
+    cleaned = frame.dropna(axis=0, how="all").dropna(axis=1, how="all").copy()
+    raw_rows = 0 if cleaned.empty else sum(1 for _, _row in cleaned.iterrows())
+    columns = [] if cleaned.empty else [str(column).strip() for column in cleaned.columns]
+    return {
+        "source_id": fingerprint("source_inspection", source_file, source_sheet or ""),
+        "source_file": source_file,
+        "source_sheet": source_sheet or "",
+        "status": "empty" if cleaned.empty else "pending",
+        "selected_table": "",
+        "selected_reason": "",
+        "guessed_table": guessed_table or "",
+        "scores": dict(scores),
+        "headers": columns,
+        "row_counts": {
+            "raw_rows": raw_rows,
+            "imported_rows": 0,
+            "derived_tables": {},
+        },
+        "field_matches": [],
+        "matched_fields": [],
+        "missing_required_columns": [],
+        "missing_required_values": [],
+        "warnings": [],
+    }
+
+
+def _apply_field_inspection(
+    inspection: dict[str, object],
+    table: str,
+    custom_map: Mapping[str, Mapping[str, Sequence[str]]] | None,
+) -> None:
+    details, _warnings = match_fields_detail(
+        inspection.get("headers") or [],
+        table,
+        custom_map,
+        include_warnings=False,
+    )
+    matched_details = [detail for detail in details if detail.get("header")]
+    matched_fields = [str(detail["field"]) for detail in matched_details]
+    required = set(required_fields_for_table(table))
+    missing_required = [
+        str(detail["field"])
+        for detail in details
+        if detail.get("required") or detail.get("field") in required
+        if not detail.get("header")
+    ]
+    inspection["field_matches"] = matched_details
+    inspection["matched_fields"] = matched_fields
+    inspection["missing_required_columns"] = missing_required
+
+
+def _selected_reason_from_warnings(
+    warnings: Sequence[Mapping[str, object]],
+    *,
+    fallback: str,
+) -> str:
+    codes = {str(warning.get("code") or "") for warning in warnings}
+    if "manifest_table_hint_used" in codes:
+        return "manifest_table_hint"
+    if "manifest_export_type_used" in codes:
+        return "manifest_export_type"
+    if "missing_manifest_table_hint" in codes:
+        return fallback
+    if "unsupported_table_hint" in codes or "unsupported_export_type" in codes:
+        return fallback
+    return fallback
+
+
+def _inspection_status(
+    records: Sequence[Mapping[str, object]],
+    inspection: Mapping[str, object],
+    warnings: Sequence[Mapping[str, object]],
+    derived_counts: Mapping[str, int],
+) -> str:
+    if not records and not derived_counts:
+        return "empty"
+    missing_columns = inspection.get("missing_required_columns") or []
+    missing_values = _missing_required_value_counts(warnings)
+    if missing_columns or missing_values:
+        return "needs_review"
+    return "importable"
+
+
+def _missing_required_value_counts(
+    warnings: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    counts: dict[str, int] = {}
+    for warning in warnings:
+        if warning.get("code") != "missing_required_value":
+            continue
+        field = str(warning.get("field") or "")
+        if not field:
+            continue
+        counts[field] = counts.get(field, 0) + 1
+    return [
+        {"field": field, "count": count}
+        for field, count in sorted(counts.items())
+    ]
+
+
+def _compact_warnings(
+    warnings: Sequence[Mapping[str, object]],
+    *,
+    limit: int = 8,
+) -> list[dict[str, object]]:
+    compacted: list[dict[str, object]] = []
+    for warning in warnings[:limit]:
+        compacted.append(
+            {
+                "code": str(warning.get("code") or "warning"),
+                "field": str(warning.get("field") or ""),
+                "message": str(warning.get("message") or ""),
+            }
+        )
+    if len(warnings) > limit:
+        compacted.append(
+            {
+                "code": "more_warnings",
+                "field": "",
+                "message": f"还有 {len(warnings) - limit} 条 warning 未在摘要中展示",
+            }
+        )
+    return compacted
 
 
 def dedupe_order_records(
@@ -319,6 +567,80 @@ def derive_order_related_records(
             }
         )
     return derived, warnings
+
+
+def derive_product_sku_records(
+    frame,
+    *,
+    shop_id: str,
+    shop_name: str | None,
+    task_id: str | None,
+    source_file: str,
+    source_sheet: str | None,
+    custom_map: Mapping[str, Mapping[str, Sequence[str]]] | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Derive product_skus from a product-list export when SKU-level columns exist."""
+    cleaned = frame.dropna(axis=0, how="all").dropna(axis=1, how="all").copy()
+    if cleaned.empty:
+        return [], []
+    cleaned.columns = [str(column).strip() for column in cleaned.columns]
+
+    sku_matches, _ = match_fields(cleaned.columns.tolist(), "product_skus", custom_map, include_warnings=False)
+    product_matches, _ = match_fields(cleaned.columns.tolist(), "products", custom_map, include_warnings=False)
+    if not (sku_matches.get("sku_id") or sku_matches.get("sku_name")):
+        return [], []
+
+    records: list[dict[str, object]] = []
+    warnings: list[dict[str, object]] = []
+    for row_number, row in cleaned.iterrows():
+        raw_row = {str(column): clean_cell(row[column]) for column in cleaned.columns}
+        if all(value is None for value in raw_row.values()):
+            continue
+
+        product_name = _matched_text(raw_row, sku_matches, "product_name") or _matched_text(raw_row, product_matches, "product_name")
+        product_id = _matched_text(raw_row, sku_matches, "product_id") or _matched_text(raw_row, product_matches, "product_id")
+        sku_id = _matched_text(raw_row, sku_matches, "sku_id")
+        sku_name = _matched_text(raw_row, sku_matches, "sku_name")
+        if not product_name:
+            continue
+        if not product_id:
+            product_id = fingerprint("product", shop_id, product_name)
+        if not sku_id:
+            sku_id = fingerprint("sku", shop_id, product_id, sku_name, raw_row)
+
+        record = {
+            "shop_id": shop_id,
+            "task_id": task_id,
+            "product_id": product_id,
+            "product_name": product_name,
+            "sku_id": sku_id,
+            "sku_name": sku_name,
+            "category": _matched_text(raw_row, sku_matches, "category") or _matched_text(raw_row, product_matches, "category"),
+            "status": _matched_text(raw_row, sku_matches, "status") or _matched_text(raw_row, product_matches, "status"),
+            "sku_price": _matched_amount(raw_row, sku_matches, "sku_price") or _matched_amount(raw_row, product_matches, "price"),
+            "stock": _matched_amount(raw_row, sku_matches, "stock") or _matched_amount(raw_row, product_matches, "stock"),
+            "barcode": _matched_text(raw_row, sku_matches, "barcode"),
+            "source_file": source_file,
+            "source_sheet": source_sheet,
+            "source_row_number": int(row_number) + 2,
+            "raw_json": stable_json(raw_row),
+            "row_fingerprint": fingerprint("product_skus", (shop_id, product_id, sku_id)),
+        }
+        if shop_name:
+            record["shop_name_snapshot"] = shop_name
+        records.append(record)
+
+    if records:
+        warnings.append(
+            {
+                "code": "product_list_skus_derived",
+                "source_file": source_file,
+                "source_sheet": source_sheet or "",
+                "derived_row_count": len(records),
+                "message": "商品列表导出包含 SKU 字段，已同步拆出 SKU 明细",
+            }
+        )
+    return records, warnings
 
 
 def _matched_text(raw_row: Mapping[str, object], matches: Mapping[str, str], field: str) -> str | None:
