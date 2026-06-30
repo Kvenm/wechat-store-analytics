@@ -1,0 +1,18 @@
+{
+  "openai": {
+    "api_key_env": "OPENAI_API_KEY",
+    "model": "gpt-4.1-mini",
+    "temperature": 0.2,
+    "dry_run": true
+  },
+  "privacy": {
+    "mask_phone": true,
+    "mask_address": true,
+    "mask_nickname": true,
+    "mask_order_id": true
+  },
+  "payload": {
+    "db_path": "data/processed/wechat_store.sqlite",
+    "top_n": 20
+  }
+}

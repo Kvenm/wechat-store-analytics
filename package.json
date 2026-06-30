@@ -1,0 +1,21 @@
+{
+  "name": "wechat-store-analytics",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "wechat-store-collect": "scripts/collect/collect.mjs"
+  },
+  "scripts": {
+    "collect": "node scripts/collect/collect.mjs",
+    "collect:orders": "node scripts/collect/collect.mjs --types orders",
+    "collect:products": "node scripts/collect/collect.mjs --types products",
+    "collect:compass": "node scripts/collect/collect.mjs --types compass"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "playwright": "^1.52.0"
+  }
+}

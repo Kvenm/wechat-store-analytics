@@ -1,0 +1,137 @@
+{
+  "defaults": {
+    "types": [
+      "orders",
+      "products",
+      "compass"
+    ],
+    "headless": false,
+    "loginTimeoutMs": 600000,
+    "downloadTimeoutMs": 120000
+  },
+  "selectors": {
+    "loggedInShell": "TODO_SELECTOR_STORE_HOME_READY",
+    "shopSwitcherButton": "TODO_SELECTOR_SHOP_SWITCHER_BUTTON",
+    "shopSearchInput": "TODO_SELECTOR_SHOP_SEARCH_INPUT",
+    "shopResult": "TODO_SELECTOR_SHOP_RESULT_{{shopLabel}}",
+    "currentShopName": "TODO_SELECTOR_CURRENT_SHOP_NAME",
+    "shopDiscoveryItems": "TODO_SELECTOR_SHOP_DISCOVERY_ITEMS",
+    "shopDiscoveryItemName": "TODO_SELECTOR_SHOP_DISCOVERY_ITEM_NAME",
+    "dateRangeButton": "TODO_SELECTOR_DATE_RANGE_BUTTON",
+    "dateStartInput": "TODO_SELECTOR_DATE_START_INPUT",
+    "dateEndInput": "TODO_SELECTOR_DATE_END_INPUT",
+    "dateConfirmButton": "TODO_SELECTOR_DATE_CONFIRM_BUTTON",
+    "noPermission": "TODO_SELECTOR_NO_PERMISSION_EMPTY_STATE"
+  },
+  "types": {
+    "transactions": {
+      "label": "Transactions export",
+      "tableHint": "orders",
+      "path": "TODO_PATH_TRANSACTIONS_EXPORT_PAGE",
+      "expectedFormats": ["xlsx", "csv"],
+      "selectors": {
+        "pageReady": "TODO_SELECTOR_TRANSACTIONS_PAGE_READY",
+        "exportButton": "TODO_SELECTOR_TRANSACTIONS_EXPORT_BUTTON"
+      }
+    },
+    "orders": {
+      "label": "Orders export",
+      "tableHint": "orders",
+      "path": "TODO_PATH_ORDERS_EXPORT_PAGE",
+      "dateRange": {
+        "mode": "custom-picker",
+        "selectors": {
+          "dateRangeButton": "TODO_SELECTOR_ORDERS_DATE_RANGE_BUTTON",
+          "dateStartInput": "TODO_SELECTOR_ORDERS_DATE_START_INPUT",
+          "dateEndInput": "TODO_SELECTOR_ORDERS_DATE_END_INPUT",
+          "dateConfirmButton": "TODO_SELECTOR_ORDERS_DATE_CONFIRM_BUTTON"
+        },
+        "notes": "Orders must apply the requested --from/--to range before full export."
+      },
+      "expectedFormats": ["xlsx", "csv"],
+      "dataCoverage": "full_export_requested",
+      "exportWorkflow": {
+        "confirmSelector": "TODO_SELECTOR_OPTIONAL_EXPORT_CONFIRM_BUTTON",
+        "confirmRequired": false,
+        "directDownloadTimeoutMs": 15000,
+        "generatedDownloadSelector": "TODO_SELECTOR_OPTIONAL_GENERATED_DOWNLOAD_BUTTON",
+        "generatedDownloadTimeoutMs": 180000
+      },
+      "selectors": {
+        "pageReady": "TODO_SELECTOR_ORDERS_PAGE_READY",
+        "exportButton": "TODO_SELECTOR_ORDERS_EXPORT_BUTTON"
+      }
+    },
+    "products": {
+      "label": "Product analytics export",
+      "tableHint": "shop_daily",
+      "path": "TODO_PATH_PRODUCT_ANALYTICS_EXPORT_PAGE",
+      "notes": "This configured products export is the 商品数据/核心转化概览 daily analytics report. Keep product master/list exports as a separate future type.",
+      "expectedFormats": ["xlsx", "csv"],
+      "selectors": {
+        "pageReady": "TODO_SELECTOR_PRODUCT_ANALYTICS_PAGE_READY",
+        "exportButton": "TODO_SELECTOR_PRODUCT_ANALYTICS_EXPORT_BUTTON"
+      }
+    },
+    "audience": {
+      "label": "Audience export",
+      "tableHint": "audience_insights",
+      "path": "TODO_PATH_AUDIENCE_EXPORT_PAGE",
+      "expectedFormats": ["xlsx", "csv"],
+      "selectors": {
+        "pageReady": "TODO_SELECTOR_AUDIENCE_PAGE_READY",
+        "exportButton": "TODO_SELECTOR_AUDIENCE_EXPORT_BUTTON"
+      }
+    },
+    "compass": {
+      "label": "Compass export",
+      "tableHint": "audience_insights",
+      "path": "TODO_PATH_COMPASS_EXPORT_PAGE",
+      "expectedFormats": ["xlsx", "csv"],
+      "selectors": {
+        "pageReady": "TODO_SELECTOR_COMPASS_PAGE_READY",
+        "exportButton": "TODO_SELECTOR_COMPASS_EXPORT_BUTTON"
+      }
+    },
+    "reviews": {
+      "label": "Reviews export",
+      "tableHint": "reviews",
+      "path": "TODO_PATH_REVIEWS_EXPORT_PAGE",
+      "expectedFormats": ["xlsx", "csv"],
+      "selectors": {
+        "pageReady": "TODO_SELECTOR_REVIEWS_PAGE_READY",
+        "exportButton": "TODO_SELECTOR_REVIEWS_EXPORT_BUTTON"
+      }
+    },
+    "repurchase": {
+      "label": "Repurchase export",
+      "tableHint": "shop_daily",
+      "path": "TODO_PATH_REPURCHASE_EXPORT_PAGE",
+      "expectedFormats": ["xlsx", "csv"],
+      "selectors": {
+        "pageReady": "TODO_SELECTOR_REPURCHASE_PAGE_READY",
+        "exportButton": "TODO_SELECTOR_REPURCHASE_EXPORT_BUTTON"
+      }
+    },
+    "funds": {
+      "label": "Funds export",
+      "tableHint": "fund_flows",
+      "path": "TODO_PATH_FUNDS_EXPORT_PAGE",
+      "expectedFormats": ["xlsx", "csv"],
+      "selectors": {
+        "pageReady": "TODO_SELECTOR_FUNDS_PAGE_READY",
+        "exportButton": "TODO_SELECTOR_FUNDS_EXPORT_BUTTON"
+      }
+    },
+    "ads": {
+      "label": "Ads export",
+      "tableHint": "ad_spend",
+      "path": "TODO_PATH_ADS_EXPORT_PAGE",
+      "expectedFormats": ["xlsx", "csv"],
+      "selectors": {
+        "pageReady": "TODO_SELECTOR_ADS_PAGE_READY",
+        "exportButton": "TODO_SELECTOR_ADS_EXPORT_BUTTON"
+      }
+    }
+  }
+}

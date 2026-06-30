@@ -1,0 +1,22 @@
+{
+  "discovery": {
+    "enabled": true,
+    "notes": "When --all-shops is used, calibrated discovery selectors in config/export-tasks.json can enumerate shops from the logged-in account. If selectors are still TODO, configured shops below are used."
+  },
+  "shops": [
+    {
+      "id": "demo-shop",
+      "name": "Demo WeChat Store",
+      "switchLabel": "Demo WeChat Store",
+      "enabled": true,
+      "notes": "Copy this file to config/shops.json and replace demo values with local, non-secret shop identifiers."
+    },
+    {
+      "id": "demo-shop-secondary",
+      "name": "Demo Secondary Store",
+      "switchLabel": "Demo Secondary Store",
+      "enabled": false,
+      "notes": "Disabled shops are written as skipped items when selected by --all-shops."
+    }
+  ]
+}
