@@ -1018,10 +1018,90 @@ def render_admin_ui() -> str:
       font-size: 14px;
       line-height: 1.45;
     }
-    .shell {
-      max-width: 1180px;
+    .app-shell {
+      width: min(1320px, 100%);
       margin: 0 auto;
       padding: 22px;
+      display: grid;
+      grid-template-columns: 220px minmax(0, 1fr);
+      gap: 18px;
+      align-items: start;
+    }
+    .side-nav {
+      position: sticky;
+      top: 18px;
+      display: grid;
+      gap: 14px;
+      align-self: start;
+      min-width: 0;
+    }
+    .side-nav-header {
+      display: grid;
+      gap: 5px;
+      padding: 12px 4px 4px;
+    }
+    .side-nav-title {
+      color: var(--text);
+      font-size: 15px;
+      font-weight: 800;
+      line-height: 1.25;
+    }
+    .side-nav-subtitle {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .side-nav-items {
+      display: grid;
+      gap: 7px;
+    }
+    .side-nav-item {
+      width: 100%;
+      min-height: 46px;
+      justify-content: flex-start;
+      display: grid;
+      gap: 2px;
+      padding: 9px 11px;
+      border-color: transparent;
+      background: transparent;
+      text-align: left;
+      font-weight: 750;
+    }
+    .side-nav-item span,
+    .side-nav-item small {
+      display: block;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .side-nav-item small {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 500;
+    }
+    .side-nav-item:hover {
+      background: #eef3f8;
+    }
+    .side-nav-item.active {
+      border-color: #b7d5c7;
+      background: #e9f4ef;
+      color: var(--accent-strong);
+    }
+    .side-nav-item.active small {
+      color: #406b5d;
+    }
+    .side-nav-footer {
+      display: grid;
+      gap: 8px;
+      padding-top: 4px;
+    }
+    .side-nav-footer a {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .main-content {
+      min-width: 0;
     }
     header {
       display: flex;
@@ -1072,6 +1152,15 @@ def render_admin_ui() -> str:
       justify-content: flex-end;
     }
     .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.05fr) minmax(320px, 0.95fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .menu-section {
+      min-width: 0;
+    }
+    .menu-grid {
       display: grid;
       grid-template-columns: minmax(0, 1.05fr) minmax(320px, 0.95fr);
       gap: 14px;
@@ -1468,6 +1557,9 @@ def render_admin_ui() -> str:
     .records {
       grid-column: 1 / -1;
     }
+    .wide-panel {
+      grid-column: 1 / -1;
+    }
     .tabs {
       display: flex;
       gap: 6px;
@@ -1484,11 +1576,35 @@ def render_admin_ui() -> str:
       color: var(--accent-strong);
     }
     .hidden { display: none; }
+    .menu-hidden { display: none !important; }
     @media (max-width: 860px) {
-      .shell { padding: 16px; }
+      .app-shell {
+        display: block;
+        padding: 16px;
+      }
+      .side-nav {
+        position: static;
+        gap: 10px;
+        margin-bottom: 14px;
+      }
+      .side-nav-header {
+        padding: 0;
+      }
+      .side-nav-items {
+        display: flex;
+        gap: 8px;
+        overflow-x: auto;
+        padding-bottom: 2px;
+      }
+      .side-nav-item {
+        flex: 0 0 136px;
+      }
+      .side-nav-footer {
+        display: none;
+      }
       header { display: grid; }
       .top-actions { justify-content: flex-start; }
-      .grid, .notice-grid, .form-grid { grid-template-columns: 1fr; }
+      .grid, .menu-grid, .notice-grid, .form-grid { grid-template-columns: 1fr; }
       .task-steps { grid-template-columns: 1fr; }
       .full { grid-column: auto; }
       dl { grid-template-columns: 100px minmax(0, 1fr); }
@@ -1496,84 +1612,48 @@ def render_admin_ui() -> str:
   </style>
 </head>
 <body>
-  <main class="shell">
-    <header>
-      <div>
-        <h1>微信小店数据本地管理台</h1>
-        <p>本地配置、服务状态和同步记录入口；Swagger 文档仍在 <a href="/docs">/docs</a>。</p>
+  <main class="app-shell">
+    <aside class="side-nav" aria-label="功能菜单">
+      <div class="side-nav-header">
+        <div class="side-nav-title">微信小店分析</div>
+        <div class="side-nav-subtitle">订单导出、分析报告，主界面只保留日常要用的入口。</div>
       </div>
-      <div class="top-actions">
-        <a class="button-link" href="/login">扫码登录</a>
-        <button type="button" id="refreshAll">刷新全部</button>
-        <a href="/docs">打开 /docs</a>
+      <nav class="side-nav-items">
+        <button type="button" class="side-nav-item menu-trigger" data-menu-target="taskSection" aria-controls="taskSection">
+          <span>订单导出分析</span>
+          <small>选时间，导订单，生成报告</small>
+        </button>
+        <button type="button" class="side-nav-item menu-trigger" data-menu-target="recordsSection" aria-controls="recordsSection">
+          <span>分析结果</span>
+          <small>查看最近生成的报告</small>
+        </button>
+      </nav>
+      <div class="side-nav-footer">
+        <a href="/login">扫码登录</a>
       </div>
-    </header>
+    </aside>
 
-    <section class="notice-grid" aria-label="采集方式说明">
-      <div class="notice warn">
-        <strong>网页导出需要扫码登录</strong>
-        <p>浏览器导出依赖微信后台登录态；需要你手动扫码，不会代替登录或验证码。</p>
-      </div>
-      <div class="notice">
-        <strong>开放 API token 测试不需要扫码登录</strong>
-        <p>开放 API 使用 AppID、AppSecret 或 AccessToken；密钥只保存到本地 .env.local，不在页面回显。</p>
-      </div>
-    </section>
+    <section class="main-content">
+      <header>
+        <div>
+          <h1>微信小店数据本地管理台</h1>
+          <p>先用本地导出文件校验和分析；真实网页采集只跑已校准的订单导出。</p>
+        </div>
+        <div class="top-actions">
+          <a class="button-link" href="/login">扫码登录</a>
+          <button type="button" id="refreshAll">刷新全部</button>
+        </div>
+      </header>
 
-    <div class="grid">
-      <section class="panel" aria-labelledby="healthTitle">
-        <div class="panel-header">
-          <h2 id="healthTitle">服务状态</h2>
-          <button type="button" id="refreshHealth">刷新状态</button>
-        </div>
-        <div class="panel-body">
-          <div id="healthMessage" class="message">读取 /health 中...</div>
-          <dl id="healthList"></dl>
-        </div>
-      </section>
-
-      <section class="panel" aria-labelledby="configStatusTitle">
-        <div class="panel-header">
-          <h2 id="configStatusTitle">配置状态</h2>
-          <button type="button" id="refreshConfig">刷新配置</button>
-        </div>
-        <div class="panel-body">
-          <div class="status-row">
-            <span id="appSecretStatus" class="chip">AppSecret 未读取</span>
-            <span id="accessTokenStatus" class="chip">AccessToken 未读取</span>
-          </div>
-          <dl id="configSummary"></dl>
-        </div>
-      </section>
-
-      <section class="panel" aria-labelledby="webLoginTitle">
-        <div class="panel-header">
-          <h2 id="webLoginTitle">网页后台扫码登录</h2>
-          <button type="button" id="refreshWebLogin">刷新状态</button>
-        </div>
-        <div class="panel-body stack">
-          <p>会打开微信小店网页版，手动扫码登录；登录态保存在 data/browser-profile；不是开放 API token。</p>
-          <div class="status-row">
-            <span id="webLoginProcessStatus" class="chip">扫码窗口未读取</span>
-            <span id="webLoginProfileStatus" class="chip">Profile 未读取</span>
-          </div>
-          <dl id="webLoginStatusList"></dl>
-          <div class="button-row">
-            <button type="button" id="openWebLogin" class="primary">打开扫码登录窗口</button>
-            <span id="webLoginMessage" class="message"></span>
-          </div>
-        </div>
-      </section>
-
-      <section class="panel records" aria-labelledby="orderTaskTitle">
+      <section id="taskSection" class="panel records menu-section" aria-labelledby="orderTaskTitle">
         <div class="panel-header">
           <h2 id="orderTaskTitle">订单真实采集与分析</h2>
           <button type="button" id="refreshTasks">刷新任务</button>
         </div>
         <div class="panel-body stack">
-          <div class="notice warn">
-            <strong>启动前请确认扫码登录窗口已关闭</strong>
-            <p>采集会复用 data/browser-profile；如果扫码登录窗口仍在运行，同一个浏览器配置可能被占用，真实采集会失败。</p>
+          <div class="notice">
+            <strong>网页订单导出</strong>
+            <p>填店铺和日期，确认已扫码登录，再启动。没有 config/shops.json 时也可手填 Shop ID。</p>
           </div>
           <form id="orderTaskForm" class="form-grid">
             <label>
@@ -1602,8 +1682,8 @@ def render_admin_ui() -> str:
             </div>
           </form>
           <div class="notice">
-            <strong>离线导入：本地导出复跑</strong>
-            <p>无法扫码测试时，可选择项目 data/raw 下已经下载过的导出目录；正式采集目录和手动放入的 Excel/CSV/zip 目录都可以先校验。</p>
+            <strong>本地导出文件</strong>
+            <p>把后台导出的 Excel/CSV/zip 放进 data/raw 下的目录，先校验，再复跑分析。</p>
           </div>
           <form id="localExportForm" class="form-grid">
             <label class="full">
@@ -1619,12 +1699,12 @@ def render_admin_ui() -> str:
             <div class="button-row full">
               <button type="button" id="checkLocalExportTask">校验本地导出文件</button>
               <button type="submit" id="startLocalExportTask">复跑本地导出文件</button>
-              <span class="hint">只允许项目 data/raw 下的目录；没有 task-metadata.json 时会按手动导出目录处理。</span>
+              <span class="hint">例：data/raw/manual-demo。没有 task-metadata.json 也可以用。</span>
             </div>
           </form>
           <div class="notice">
             <strong>模块能力</strong>
-            <p>真实网页采集只开放已校准模块；本地导入可以先处理你手动从后台导出的 Excel、CSV 或 zip。</p>
+            <p>绿色表示可用；未校准的网页模块请先走本地导入。</p>
           </div>
           <div id="capabilityMessage" class="message">读取 /capabilities 中...</div>
           <div id="capabilitiesPanel" class="capability-grid"></div>
@@ -1639,105 +1719,18 @@ def render_admin_ui() -> str:
         </div>
       </section>
 
-      <section class="panel" aria-labelledby="configTitle">
+      <section id="recordsSection" class="panel records menu-section" aria-labelledby="recordsTitle">
         <div class="panel-header">
-          <h2 id="configTitle">开放 API 配置</h2>
-          <span class="hint">保存到项目根目录 .env.local</span>
-        </div>
-        <form id="configForm" class="panel-body">
-          <div class="form-grid">
-            <label>
-              AppID
-              <input id="appId" name="app_id" autocomplete="off" placeholder="WECHAT_STORE_APP_ID">
-            </label>
-            <label>
-              API Base URL
-              <input id="apiBaseUrl" name="api_base_url" autocomplete="off" placeholder="https://api.weixin.qq.com">
-            </label>
-            <label>
-              AppSecret
-              <input id="appSecret" name="app_secret" type="password" autocomplete="new-password" placeholder="留空则保留当前值">
-              <span class="hint">不会通过 /api-config 回显。</span>
-            </label>
-            <label>
-              AccessToken
-              <input id="accessToken" name="access_token" type="password" autocomplete="new-password" placeholder="留空则保留当前值">
-              <span class="hint">不会通过 /api-config 回显。</span>
-            </label>
-            <label>
-              Raw Archive Dir
-              <input id="rawArchiveDir" name="raw_archive_dir" autocomplete="off" placeholder="data/raw/api">
-            </label>
-            <label class="checkbox-row">
-              <input id="syncDryRun" name="sync_dry_run" type="checkbox">
-              Dry Run
-            </label>
-            <label>
-              Shop ID
-              <input id="shopId" name="shop_id" autocomplete="off" placeholder="local-shop-id">
-            </label>
-            <label>
-              Shop Name
-              <input id="shopName" name="shop_name" autocomplete="off" placeholder="门店名称">
-            </label>
-          </div>
-          <div class="button-row">
-            <button type="submit" class="primary">保存配置</button>
-            <button type="button" id="clearSensitive">清空密钥输入框</button>
-            <span id="configMessage" class="message"></span>
-          </div>
-        </form>
-      </section>
-
-      <section class="panel" aria-labelledby="tokenTitle">
-        <div class="panel-header">
-          <h2 id="tokenTitle">AccessToken 获取</h2>
-          <button type="button" id="fetchAccessToken">获取 AccessToken</button>
-        </div>
-        <div class="panel-body stack">
-          <p>需要先填 AppID/AppSecret；获取后才可继续真实接口测试。页面只显示过期时间和来源，不显示 token 明文。</p>
-          <div id="tokenResult" class="result-box">尚未请求 /api-token/fetch。</div>
-        </div>
-      </section>
-
-      <section class="panel" aria-labelledby="quickGuideTitle">
-        <div class="panel-header">
-          <h2 id="quickGuideTitle">操作提示</h2>
-        </div>
-        <div class="panel-body stack">
-          <div>
-            <strong>只做本地配置</strong>
-            <p>保存配置不会启动真实微信 API，也不会发起浏览器导出任务。</p>
-          </div>
-          <div>
-            <strong>密钥保护</strong>
-            <p>AppSecret 和 AccessToken 只显示已配置/未配置；留空保存会保留旧值。</p>
-          </div>
-          <div>
-            <strong>同步记录</strong>
-            <p>下方读取 /sync-runs 和 /raw-api-responses，便于回看 API 同步元数据和原始归档索引。</p>
-          </div>
-        </div>
-      </section>
-
-      <section class="panel records" aria-labelledby="recordsTitle">
-        <div class="panel-header">
-          <h2 id="recordsTitle">同步记录</h2>
-          <div class="tabs" role="tablist" aria-label="同步记录切换">
-            <button type="button" id="tasksTab" class="tab active">采集任务</button>
-            <button type="button" id="syncRunsTab" class="tab">/sync-runs</button>
-            <button type="button" id="rawResponsesTab" class="tab">/raw-api-responses</button>
-            <button type="button" id="refreshRecords">刷新记录</button>
-          </div>
+          <h2 id="recordsTitle">分析结果</h2>
+          <button type="button" id="refreshRecords">刷新结果</button>
         </div>
         <div class="panel-body">
-          <div id="recordsMessage" class="message">读取同步记录中...</div>
-          <div id="tasksPanel" class="table-wrap"></div>
-          <div id="syncRunsPanel" class="table-wrap hidden"></div>
-          <div id="rawResponsesPanel" class="table-wrap hidden"></div>
+          <div id="recordsMessage" class="message">读取分析结果中...</div>
+          <div id="reportsPanel" class="table-wrap"></div>
+          <div id="reportDetail" class="result-box report-preview hidden"></div>
         </div>
       </section>
-    </div>
+    </section>
   </main>
 
   <script>
@@ -1763,12 +1756,14 @@ def render_admin_ui() -> str:
 
     function setMessage(id, text, kind = "") {
       const el = $(id);
+      if (!el) return;
       el.textContent = text;
       el.className = `message ${kind}`.trim();
     }
 
     function renderDefinitionList(id, rows) {
       const el = $(id);
+      if (!el) return;
       el.innerHTML = rows.map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(String(value || "-"))}</dd>`).join("");
     }
 
@@ -1783,8 +1778,23 @@ def render_admin_ui() -> str:
 
     function statusChip(id, label, configured) {
       const el = $(id);
+      if (!el) return;
       el.textContent = `${label} ${configured ? "已配置" : "未配置"}`;
       el.className = `chip ${configured ? "ok" : "bad"}`;
+    }
+
+    function selectMenuSection(targetId = "taskSection") {
+      const sections = document.querySelectorAll(".menu-section");
+      const triggers = document.querySelectorAll(".side-nav-item");
+      const target = $(targetId) ? targetId : "taskSection";
+      sections.forEach((section) => {
+        section.classList.toggle("menu-hidden", section.id !== target);
+      });
+      triggers.forEach((trigger) => {
+        const isActive = trigger.dataset.menuTarget === target;
+        trigger.classList.toggle("active", isActive);
+        trigger.setAttribute("aria-current", isActive ? "page" : "false");
+      });
     }
 
     async function loadHealth() {
@@ -1804,6 +1814,7 @@ def render_admin_ui() -> str:
     }
 
     async function loadConfig() {
+      if (!$("configForm")) return;
       setMessage("configMessage", "读取 /api-config 中...");
       try {
         const data = await fetchJson("/api-config");
@@ -1906,6 +1917,7 @@ def render_admin_ui() -> str:
     }
 
     async function loadWebLoginStatus() {
+      if (!$("webLoginStatusList")) return;
       setMessage("webLoginMessage", "读取 /web-login/status 中...");
       try {
         const data = await fetchJson("/web-login/status");
@@ -2333,88 +2345,80 @@ def render_admin_ui() -> str:
     }
 
     async function loadRecords() {
-      setMessage("recordsMessage", "读取采集任务、/sync-runs 和 /raw-api-responses 中...");
+      setMessage("recordsMessage", "读取分析结果中...");
       try {
-        const [tasks, syncRuns, rawResponses] = await Promise.all([
-          fetchJson("/tasks"),
-          fetchJson("/sync-runs?limit=20"),
-          fetchJson("/raw-api-responses?limit=20"),
-        ]);
-        renderTable("tasksPanel", tasks || [], [
-          { key: "id", label: "Task ID" },
-          { key: "shop_id", label: "Shop ID" },
-          { key: "shop_name_snapshot", label: "Shop Name" },
-          { key: "source_type", label: "Source" },
-          { key: "status", label: "Status" },
-          { key: "started_at", label: "Started" },
-          { key: "completed_at", label: "Finished" },
-          { key: "collection_task_id", label: "Collector Task" },
-        ]);
-        renderTable("syncRunsPanel", syncRuns || [], [
-          { key: "sync_run_id", label: "Sync Run ID" },
-          { key: "shop_id", label: "Shop ID" },
-          { key: "shop_name_snapshot", label: "Shop Name" },
-          { key: "source_kind", label: "Source" },
-          { key: "status", label: "Status" },
-          { key: "started_at", label: "Started" },
-          { key: "finished_at", label: "Finished" },
-          { key: "item_count", label: "Items" },
-          { key: "raw_response_count", label: "Raw" },
-        ]);
-        renderTable("rawResponsesPanel", rawResponses || [], [
-          { key: "raw_response_id", label: "Raw Response ID" },
-          { key: "sync_run_id", label: "Sync Run ID" },
-          { key: "shop_id", label: "Shop ID" },
-          { key: "endpoint", label: "Endpoint" },
-          { key: "status", label: "Status" },
-          { key: "record_count", label: "Records" },
-          { key: "size_bytes", label: "Bytes" },
-          { key: "pulled_at", label: "Pulled" },
-        ]);
-        setMessage("recordsMessage", "同步记录已加载。", "ok");
+        const reports = await fetchJson("/reports");
+        renderReports(reports || []);
+        setMessage("recordsMessage", "分析结果已加载。", "ok");
       } catch (error) {
         setMessage("recordsMessage", error.message, "error");
       }
     }
 
-    function selectRecordsTab(tab) {
-      state.activeRecords = tab;
-      const showTasks = tab === "tasks";
-      const showSyncRuns = tab === "syncRuns";
-      $("tasksPanel").classList.toggle("hidden", !showTasks);
-      $("syncRunsPanel").classList.toggle("hidden", !showSyncRuns);
-      $("rawResponsesPanel").classList.toggle("hidden", tab !== "rawResponses");
-      $("tasksTab").classList.toggle("active", showTasks);
-      $("syncRunsTab").classList.toggle("active", showSyncRuns);
-      $("rawResponsesTab").classList.toggle("active", tab === "rawResponses");
+    function renderReports(reports) {
+      const el = $("reportsPanel");
+      if (!reports.length) {
+        el.innerHTML = '<div class="empty">暂无分析报告</div>';
+        $("reportDetail").classList.add("hidden");
+        return;
+      }
+      const rows = reports.slice(0, 20).map((report) => `
+        <tr>
+          <td>${escapeHtml(report.title || report.id || "-")}</td>
+          <td>${escapeHtml(report.shop_name_snapshot || report.shop_id || "-")}</td>
+          <td>${escapeHtml(report.date || report.created_at || "-")}</td>
+          <td><button type="button" class="tab report-open" data-report-id="${escapeHtml(report.id || "")}">查看</button></td>
+        </tr>
+      `).join("");
+      el.innerHTML = `<table><thead><tr><th>报告</th><th>店铺</th><th>日期</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>`;
+      document.querySelectorAll(".report-open").forEach((button) => {
+        button.addEventListener("click", () => loadReportDetail(button.dataset.reportId));
+      });
+      const first = reports[0];
+      if (first?.id) {
+        loadReportDetail(first.id);
+      }
+    }
+
+    async function loadReportDetail(reportId) {
+      if (!reportId) return;
+      try {
+        const report = await fetchJson(`/reports/${encodeURIComponent(reportId)}`);
+        $("reportDetail").textContent = report.content || "报告没有可展示的正文。";
+        $("reportDetail").classList.remove("hidden");
+      } catch (error) {
+        $("reportDetail").textContent = `报告读取失败：${error.message}`;
+        $("reportDetail").classList.remove("hidden");
+      }
     }
 
     async function refreshAll() {
       setDefaultDates();
-      await Promise.all([loadHealth(), loadConfig(), loadWebLoginStatus(), loadCapabilities(), loadTasks(), loadRecords()]);
+      await Promise.all([loadCapabilities(), loadTasks(), loadRecords()]);
     }
 
-    $("configForm").addEventListener("submit", saveConfig);
-    $("refreshHealth").addEventListener("click", loadHealth);
-    $("refreshConfig").addEventListener("click", loadConfig);
-    $("refreshWebLogin").addEventListener("click", loadWebLoginStatus);
-    $("refreshRecords").addEventListener("click", loadRecords);
-    $("refreshAll").addEventListener("click", refreshAll);
-    $("fetchAccessToken").addEventListener("click", fetchAccessToken);
-    $("openWebLogin").addEventListener("click", openWebLogin);
-    $("orderTaskForm").addEventListener("submit", startOrderTask);
-    $("localExportForm").addEventListener("submit", startLocalExportTask);
-    $("checkLocalExportTask").addEventListener("click", checkLocalExportTask);
-    $("refreshTasks").addEventListener("click", loadTasks);
-    $("tasksTab").addEventListener("click", () => selectRecordsTab("tasks"));
-    $("syncRunsTab").addEventListener("click", () => selectRecordsTab("syncRuns"));
-    $("rawResponsesTab").addEventListener("click", () => selectRecordsTab("rawResponses"));
-    $("clearSensitive").addEventListener("click", () => {
+    $("configForm")?.addEventListener("submit", saveConfig);
+    $("refreshHealth")?.addEventListener("click", loadHealth);
+    $("refreshConfig")?.addEventListener("click", loadConfig);
+    $("refreshWebLogin")?.addEventListener("click", loadWebLoginStatus);
+    $("refreshRecords")?.addEventListener("click", loadRecords);
+    $("refreshAll")?.addEventListener("click", refreshAll);
+    $("fetchAccessToken")?.addEventListener("click", fetchAccessToken);
+    $("openWebLogin")?.addEventListener("click", openWebLogin);
+    $("orderTaskForm")?.addEventListener("submit", startOrderTask);
+    $("localExportForm")?.addEventListener("submit", startLocalExportTask);
+    $("checkLocalExportTask")?.addEventListener("click", checkLocalExportTask);
+    $("refreshTasks")?.addEventListener("click", loadTasks);
+    document.querySelectorAll(".side-nav-item").forEach((trigger) => {
+      trigger.addEventListener("click", () => selectMenuSection(trigger.dataset.menuTarget));
+    });
+    $("clearSensitive")?.addEventListener("click", () => {
       $("appSecret").value = "";
       $("accessToken").value = "";
       setMessage("configMessage", "密钥输入框已清空；保存时会保留旧值。");
     });
 
+    selectMenuSection("taskSection");
     refreshAll();
   </script>
 </body>

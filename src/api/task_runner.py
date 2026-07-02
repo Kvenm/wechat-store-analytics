@@ -135,12 +135,10 @@ def normalize_web_export_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             raise TaskRunnerError("请选择一个店铺后再启动真实采集。")
 
     configured_shop = _shop_by_id(configured_shops, shop_id)
-    if configured_shop is None:
-        raise TaskRunnerError(f"店铺 {shop_id} 不在 config/shops.json 中，暂不允许页面直接采集。")
-    if configured_shop.get("enabled") is False:
+    if configured_shop and configured_shop.get("enabled") is False:
         raise TaskRunnerError(f"店铺 {shop_id} 已在 config/shops.json 中禁用。")
 
-    shop_name = shop_name or _text(configured_shop.get("name")) or shop_id
+    shop_name = shop_name or _text((configured_shop or {}).get("name")) or shop_id
     headless = bool(params.get("headless", False))
     task_name = _text(payload.get("task_name")) or f"订单导出分析 {date_from} 至 {date_to}"
 
@@ -952,6 +950,8 @@ def _configured_shops() -> list[dict[str, Any]]:
     path = PROJECT_ROOT / "config" / "shops.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
     except OSError as exc:
         raise TaskRunnerError(f"读取 config/shops.json 失败：{exc}") from exc
     except json.JSONDecodeError as exc:

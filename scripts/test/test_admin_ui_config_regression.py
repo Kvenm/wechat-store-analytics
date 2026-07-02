@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 import traceback
@@ -30,8 +31,11 @@ def main() -> int:
         test_post_api_config_writes_env_local,
         test_empty_secret_and_token_do_not_overwrite_existing_values,
         test_root_html_contains_core_admin_ui_elements,
+        test_root_html_uses_left_menu_sections,
         test_root_html_marks_local_export_entry_frontend_pending,
         test_capabilities_exposes_registry_without_secrets,
+        test_web_export_accepts_manual_shop_without_shops_json,
+        test_web_export_accepts_manual_shop_not_in_shops_json,
         test_task_check_accepts_only_supported_order_export,
         test_task_check_accepts_local_export_product_list,
         test_task_check_accepts_local_export_auto,
@@ -182,37 +186,11 @@ def test_root_html_contains_core_admin_ui_elements() -> None:
 
     expected_fragments = (
         "微信小店数据本地管理台",
-        "服务状态",
-        "/health",
-        "开放 API 配置",
-        "AppID",
-        "AppSecret",
-        "AccessToken",
-        "获取 AccessToken",
-        "/api-token/fetch",
-        "需要先填 AppID/AppSecret",
-        "页面只显示过期时间和来源，不显示 token 明文",
-        "API Base URL",
-        "Raw Archive Dir",
-        "Dry Run",
         "Shop ID",
         "Shop Name",
-        "配置状态",
-        "已配置",
-        "未配置",
-        "同步记录",
-        "/sync-runs",
-        "/raw-api-responses",
-        "网页导出需要扫码登录",
-        "开放 API token 测试不需要扫码登录",
-        "网页后台扫码登录",
         'href="/login"',
         "扫码登录",
-        "打开扫码登录窗口",
-        "会打开微信小店网页版，手动扫码登录；登录态保存在 data/browser-profile；不是开放 API token",
-        "/web-login/status",
-        "/web-login/open",
-        "订单真实采集与分析",
+        "网页订单导出",
         "启动订单导出分析",
         "orderTaskForm",
         "collectFrom",
@@ -222,9 +200,56 @@ def test_root_html_contains_core_admin_ui_elements() -> None:
         "导出/本地文件",
         "导入数据",
         "生成报告",
+        "微信小店分析",
+        "功能菜单",
+        "订单导出分析",
+        "分析结果",
+        "reportsPanel",
+        "reportDetail",
+        "/reports",
+        "side-nav",
+        "main-content",
+        "selectMenuSection",
+        "menu-hidden",
     )
     for fragment in expected_fragments:
         assert fragment in html, f"root HTML missing core element: {fragment}"
+
+
+def test_root_html_uses_left_menu_sections() -> None:
+    response = admin_app.root()
+    html = response.body.decode("utf-8")
+
+    assert '<main class="app-shell">' in html
+    assert '<main class="shell">' not in html
+    assert 'class="side-nav-item menu-trigger"' in html
+    assert 'document.querySelectorAll(".menu-section")' in html
+    assert 'document.querySelectorAll(".side-nav-item")' in html
+    assert 'classList.toggle("menu-hidden"' in html
+    assert 'classList.toggle("active"' in html
+    assert 'selectMenuSection("taskSection")' in html
+
+    expected_sections = {
+        "taskSection",
+        "recordsSection",
+    }
+    targets = set(re.findall(r'data-menu-target="([^"]+)"', html))
+    section_ids = set(re.findall(r'<section id="([^"]+)" class="[^"]*menu-section', html))
+
+    assert targets == expected_sections
+    assert expected_sections <= section_ids
+    for section_id in expected_sections:
+      assert f'aria-controls="{section_id}"' in html
+
+    hidden_admin_fragments = (
+        "开放 API 配置",
+        "状态总览",
+        "同步记录",
+        "API 配置",
+        "/docs",
+    )
+    for fragment in hidden_admin_fragments:
+        assert fragment not in html, f"root HTML should not expose admin element: {fragment}"
 
 
 def test_root_html_marks_local_export_entry_frontend_pending() -> None:
@@ -232,8 +257,8 @@ def test_root_html_marks_local_export_entry_frontend_pending() -> None:
     html = response.body.decode("utf-8")
 
     expected_fragments = (
-        "离线导入",
-        "本地导出复跑",
+        "本地导出文件",
+        "先校验，再复跑分析",
         "local_export",
         "source_dir",
         "localExportTypes",
@@ -267,6 +292,52 @@ def test_capabilities_exposes_registry_without_secrets() -> None:
     payload = json.dumps(result, ensure_ascii=False, sort_keys=True)
     assert "token" not in payload.lower()
     assert "secret" not in payload.lower()
+
+
+def test_web_export_accepts_manual_shop_without_shops_json() -> None:
+    with patched_shops_config_missing():
+        result = admin_app.check_task_request(
+            admin_app.TaskRequest(
+                shop_id=SHOP_ID,
+                source_type="web_export",
+                params={
+                    "from": "2026-06-01",
+                    "to": "2026-06-03",
+                    "types": ["orders"],
+                    "shop_name": SHOP_NAME,
+                },
+            )
+        )
+
+    assert result["status"] == "ok"
+    assert result["data"]["shop_id"] == SHOP_ID
+    assert result["data"]["shop_name"] == SHOP_NAME
+
+
+def test_web_export_accepts_manual_shop_not_in_shops_json() -> None:
+    with patched_shops_config(
+        {
+            "shops": [
+                {"id": "configured-shop", "name": "Configured Shop", "enabled": True},
+            ]
+        }
+    ):
+        result = admin_app.check_task_request(
+            admin_app.TaskRequest(
+                shop_id=SHOP_ID,
+                source_type="web_export",
+                params={
+                    "from": "2026-06-01",
+                    "to": "2026-06-03",
+                    "types": ["orders"],
+                    "shop_name": SHOP_NAME,
+                },
+            )
+        )
+
+    assert result["status"] == "ok"
+    assert result["data"]["shop_id"] == SHOP_ID
+    assert result["data"]["shop_name"] == SHOP_NAME
 
 
 def test_task_check_accepts_only_supported_order_export() -> None:
@@ -545,6 +616,39 @@ class patched_env_file:
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         admin_app.ENV_LOCAL_PATH = self.original_path
+        self.temp_dir_context.cleanup()
+
+
+class patched_shops_config_missing:
+    def __enter__(self) -> Path:
+        self.temp_dir_context = tempfile.TemporaryDirectory(prefix="wechat_missing_shops_config_")
+        self.project_root = Path(self.temp_dir_context.name)
+        (self.project_root / "config").mkdir(parents=True, exist_ok=True)
+        self.original_task_runner_root = admin_app.normalize_web_export_payload.__globals__["PROJECT_ROOT"]
+        admin_app.normalize_web_export_payload.__globals__["PROJECT_ROOT"] = self.project_root
+        return self.project_root
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        admin_app.normalize_web_export_payload.__globals__["PROJECT_ROOT"] = self.original_task_runner_root
+        self.temp_dir_context.cleanup()
+
+
+class patched_shops_config:
+    def __init__(self, data: dict[str, object]) -> None:
+        self.data = data
+
+    def __enter__(self) -> Path:
+        self.temp_dir_context = tempfile.TemporaryDirectory(prefix="wechat_shops_config_")
+        self.project_root = Path(self.temp_dir_context.name)
+        config_dir = self.project_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "shops.json").write_text(json.dumps(self.data, ensure_ascii=False), encoding="utf-8")
+        self.original_task_runner_root = admin_app.normalize_web_export_payload.__globals__["PROJECT_ROOT"]
+        admin_app.normalize_web_export_payload.__globals__["PROJECT_ROOT"] = self.project_root
+        return self.project_root
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        admin_app.normalize_web_export_payload.__globals__["PROJECT_ROOT"] = self.original_task_runner_root
         self.temp_dir_context.cleanup()
 
 
