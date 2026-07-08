@@ -350,6 +350,8 @@ def test_root_html_contains_api_sync_entry() -> None:
         "startApiSyncTask",
         "selectedApiSyncEndpoints",
         "renderApiSyncResult",
+        "renderTaskSteps(Object.fromEntries",
+        "任务\", \"数据同步",
         "/api-sync/runs",
         "完成后生成分析报告",
         "开始数据同步",

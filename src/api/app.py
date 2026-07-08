@@ -2600,6 +2600,19 @@ def render_admin_ui() -> str:
       const rows = (result.items || []).reduce((sum, item) => sum + Number(item.row_count || 0), 0);
       const reportId = result.report?.report_id || "-";
       const moduleCount = new Set((result.items || []).map((item) => item.table_hint || item.export_type || item.endpoint)).size;
+      const isOk = result.status === "completed";
+      $("taskStateChip").textContent = `任务 ${statusLabel(result.status || "unknown")}`;
+      $("taskStateChip").className = `chip ${isOk ? "ok" : "bad"}`;
+      $("taskReportChip").textContent = result.report?.report_id ? `报告 ${result.report.report_id}` : "暂无报告";
+      $("taskReportChip").className = `chip ${result.report?.report_id ? "ok" : ""}`.trim();
+      renderDefinitionList("taskSummary", [
+        ["任务", "数据同步"],
+        ["店铺", $("collectShopName").value || $("collectShopId").value || "-"],
+        ["周期", `${$("collectFrom").value || "-"} 至 ${$("collectTo").value || "-"}`],
+        ["状态", statusLabel(result.status || "unknown")],
+        ["报告", result.report?.report_id || "-"],
+      ]);
+      renderTaskSteps(Object.fromEntries(Object.keys(taskStepLabels).map((key) => [key, { status: isOk ? "completed" : "failed" }])));
       setTaskResultHtml(`
         <div class="check-summary">
           <div><strong>数据同步完成</strong></div>
@@ -2609,7 +2622,7 @@ def render_admin_ui() -> str:
             <div class="metric-card"><strong>${escapeHtml(reportId)}</strong><span>分析报告</span></div>
           </div>
         </div>
-      `, result.status === "completed" ? "ok" : "error");
+      `, isOk ? "ok" : "error");
     }
 
     function startTaskPolling(taskId) {
