@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hmac
 import json
 import subprocess
 import urllib.error
@@ -9,8 +11,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 from api.repository import LocalRepository
@@ -34,6 +36,7 @@ app = FastAPI(
 ENV_LOCAL_PATH = PROJECT_ROOT / ".env.local"
 DEFAULT_WECHAT_API_BASE_URL = "https://api.weixin.qq.com"
 ACCESS_TOKEN_SOURCE = "stable_token"
+ADMIN_AUTH_REALM = "WeChat Store Admin"
 WEB_LOGIN_URL = "https://store.weixin.qq.com/"
 WEB_LOGIN_SCRIPT_PATH = PROJECT_ROOT / "scripts" / "auth" / "open_wechat_store_login.mjs"
 WEB_LOGIN_PROFILE_DIR = PROJECT_ROOT / "data" / "browser-profile"
@@ -60,6 +63,19 @@ ACCESS_TOKEN_ENV_KEYS: tuple[str, ...] = (
     "WECHAT_STORE_ACCESS_TOKEN_EXPIRES_AT",
     "WECHAT_STORE_ACCESS_TOKEN_SOURCE",
 )
+
+
+@app.middleware("http")
+async def require_admin_basic_auth(request: Request, call_next: Any) -> Any:
+    if request.url.path != "/health":
+        env_values = parse_env_file(ENV_LOCAL_PATH)
+        if admin_auth_enabled(env_values) and not admin_basic_auth_valid(request.headers.get("authorization", ""), env_values):
+            return Response(
+                "Authentication required.",
+                status_code=401,
+                headers={"WWW-Authenticate": f'Basic realm="{ADMIN_AUTH_REALM}"'},
+            )
+    return await call_next(request)
 
 
 class TaskRequest(BaseModel):
@@ -103,6 +119,27 @@ def response(status: str, message: str, data: Any) -> dict[str, Any]:
 
 def repository() -> LocalRepository:
     return LocalRepository()
+
+
+def admin_auth_enabled(env_values: Mapping[str, str]) -> bool:
+    return bool(clean_config_value(env_values.get("WECHAT_STORE_ADMIN_PASSWORD", "")))
+
+
+def admin_basic_auth_valid(header: str, env_values: Mapping[str, str]) -> bool:
+    expected_password = clean_config_value(env_values.get("WECHAT_STORE_ADMIN_PASSWORD", ""))
+    if not expected_password:
+        return True
+    expected_user = clean_config_value(env_values.get("WECHAT_STORE_ADMIN_USER", "")) or "admin"
+    if not header.casefold().startswith("basic "):
+        return False
+    try:
+        decoded = base64.b64decode(header.split(" ", 1)[1], validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return False
+    if ":" not in decoded:
+        return False
+    user, password = decoded.split(":", 1)
+    return hmac.compare_digest(user, expected_user) and hmac.compare_digest(password, expected_password)
 
 
 def model_to_dict(model: BaseModel) -> dict[str, Any]:
