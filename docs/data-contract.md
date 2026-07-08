@@ -21,8 +21,8 @@
 
 | 类型 | 版本 | 说明 |
 |---|---|---|
-| `export_file` | V1 | 微信小店后台导出的 Excel/CSV，是第一版唯一正式数据源 |
-| `api_pull` | V1 API 同步预留 | 后端服务调用微信小店只读 API 后归档的 JSON/JSONL；当前仅有 mock connector，不连接真实微信 |
+| `export_file` | V1 | 微信小店后台导出的 Excel/CSV，是本地导入和人工复核的稳定数据源 |
+| `api_pull` | V1 | 后端服务调用微信小店官方业务查询 API 后归档的 JSON；可使用商家自研 token 或 ISV 授权后的 `authorizer_access_token`，同步后可直接生成分析报告 |
 | `web_table` | V1 兜底预留 | 页面表格读取，仅在导出不可用时作为后备 |
 | `chart_image` | V2 | 图表截图或页面图表图片，第二版解析 |
 | `ocr` | V2 | OCR 识别结果，第二版解析 |
@@ -31,7 +31,7 @@ V1 的导入层优先使用采集 manifest。导入会在 `--source-dir` 下、�
 
 manifest 存在时，默认只导入 manifest 中 `status=completed` 且 `source_kind/source_type` 为 `export_file` 的 artifact；未登记文件、非导出文件、未完成 artifact、店铺/任务不一致、sha256 或文件大小不一致的文件都会跳过，不能再回退为普通目录猜表。manifest 不存在时，才使用旧的目录遍历和启发式猜表导入。
 
-`api_pull` 不走 Excel/CSV 导入器。API 同步应先由后端 connector 归档原始响应文件，再写入 `sync_runs`、`sync_run_items`、`raw_api_responses` 等同步元数据表；再由专门 mapper 把只读 API 数据写入标准业务表。当前离线 mock 已实现商品、订单、售后退款、资金流水 endpoint 到 `products` / `product_skus` / `orders` / `order_items` / `refunds` / `fund_flows` 的 mapper，但仍不连接真实微信接口。Codex、MCP 和 AI 不直接调用微信 API，也不读取或保存 token、cookie、AppSecret、Authorization header。
+`api_pull` 不走 Excel/CSV 导入器，也不追求拿到后台导出按钮生成的同款文件。API 同步先由后端 connector 归档原始响应文件，再写入 `sync_runs`、`sync_run_items`、`raw_api_responses` 等同步元数据表；再由专门 mapper 把官方业务查询数据写入标准业务表。当前真实 connector 已覆盖商品、订单、售后退款、资金流水 endpoint 到 `products` / `product_skus` / `orders` / `order_items` / `refunds` / `fund_flows` 的映射；罗盘/经营数据在字段能匹配标准别名时写入 `shop_daily` / `product_daily` / `audience_insights` 等分析表。离线 mock connector 保留用于无网络回归测试。Codex、MCP 和 AI 不直接调用微信 API，也不读取或保存 token、cookie、AppSecret、Authorization header。
 
 标准表识别优先级为：
 
@@ -66,7 +66,7 @@ Excel 文件会逐个 sheet 读取。每个文件或 sheet 会根据文件名、
 
 ## API 同步元数据
 
-API 同步链路当前只实现离线 `mock_wechat` connector，用来验证后续真实微信 API 接入的归档、审计框架和业务 mapper。真实微信 API 接入前必须先完成授权、token、额度、回调验签和隐私边界设计。
+API 同步链路包含两个 connector：离线 `mock_wechat` 用于回归测试，真实 `wechat_api` 用于后端服务调用微信小店开放 API。真实运行前必须在服务端完成授权、token 获取/刷新、接口额度、回调验签和隐私边界配置。
 
 | 表 | 用途 |
 |---|---|
@@ -75,6 +75,20 @@ API 同步链路当前只实现离线 `mock_wechat` connector，用来验证后�
 | `raw_api_responses` | 原始 API 响应归档索引，只存路径、sha256、size、record_count、schema_version 和脱敏 metadata |
 
 `raw_api_responses.raw_json` 只能保存内容类型、fixture/schema 版本、是否已脱敏等元信息；完整响应体保存到私有归档文件。归档文件和 SQLite 中都不允许出现 `access_token`、`refresh_token`、`authorization`、`cookie`、`appsecret`、`secret`、`session` 等敏感字段。
+
+默认真实 API endpoint 覆盖：
+
+| endpoint 名称 | 微信小店接口 | 标准表 |
+|---|---|---|
+| `products` | `/channels/ec/product/list/get` + `/channels/ec/product/get` | `products`、`product_skus` |
+| `orders` | `/channels/ec/order/list/get` + `/channels/ec/order/get` | `orders`、`order_items` |
+| `aftersale` | `/channels/ec/aftersale/getaftersalelist` + `/channels/ec/aftersale/getaftersaleorder` | `refunds` |
+| `funds` | `/channels/ec/funds/getfundsflowlist` + `/channels/ec/funds/getfundsflowdetail` | `fund_flows` |
+| `compass_shop` | `/channels/ec/compass/shop/overall/get` | `shop_daily` |
+| `compass_product` | `/channels/ec/compass/shop/product/list/get` | `product_daily` |
+| `compass_audience` | `/channels/ec/compass/shop/sale/profile/data/get` | `audience_insights` |
+
+`reviews`、`traffic_sources`、`ad_spend` 标准表仍由本地导出导入稳定覆盖；在没有明确官方 endpoint 和字段样例前，API-only 不伪造这些接口。拿到官方路径后，可用 `reviews:/channels/...`、`traffic_sources:/channels/...`、`ad_spend:/channels/...` 形式把响应记录走通用标准表 mapper。
 
 无法识别时不会导入该 sheet，会写入 `unknown_table` warning。manifest 参与识别时也会写入 warning，显式标记已使用、无效、缺失、匹配不到、被忽略或与启发式猜表不一致的情况。
 

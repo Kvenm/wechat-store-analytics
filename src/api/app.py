@@ -7,7 +7,7 @@ import urllib.request
 from datetime import datetime
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -20,8 +20,10 @@ from api.task_runner import get_runtime_task
 from api.task_runner import list_runtime_tasks
 from api.task_runner import normalize_web_export_payload
 from api.task_runner import start_web_export_task
+from shared.ids import new_id
 from shared.module_registry import module_capabilities
 from shared.paths import PROJECT_ROOT
+from sync.wechat_api import DEFAULT_API_BASE_URL, create_api_sync_report, run_wechat_api_sync
 
 
 app = FastAPI(
@@ -76,6 +78,19 @@ class ApiConfigRequest(BaseModel):
     raw_archive_dir: Optional[str] = None
     shop_id: Optional[str] = None
     shop_name: Optional[str] = None
+
+
+class ApiSyncRunRequest(BaseModel):
+    shop_id: Optional[str] = None
+    shop_name: Optional[str] = None
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    sync_run_id: Optional[str] = None
+    endpoints: Optional[list[str]] = None
+    page_size: int = 30
+    max_pages: int = 20
+    generate_report: bool = True
+    endpoint_params: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 def response(status: str, message: str, data: Any) -> dict[str, Any]:
@@ -150,6 +165,14 @@ def fetch_api_token() -> dict[str, Any]:
     if result["status"] == "error":
         return response("error", result["message"], result["data"])
     return response("ok", result["message"], result["data"])
+
+
+@app.post("/api-sync/runs")
+def create_api_sync_run(payload: ApiSyncRunRequest) -> dict[str, Any]:
+    result = run_configured_api_sync(model_to_dict(payload))
+    if result["status"] == "error":
+        return response("error", result["message"], result["data"])
+    return response("ok", "微信小店 API 同步完成。", result["data"])
 
 
 @app.post("/web-login/open")
@@ -324,7 +347,7 @@ def fetch_and_store_access_token() -> dict[str, Any]:
     if not app_id or not app_secret:
         return {
             "status": "error",
-            "message": "请先填写 AppID 和 AppSecret，再获取 AccessToken。",
+            "message": "请先完成服务端接口应用和接口密钥配置，再获取接口授权。",
             "data": {
                 "configured": bool(env_values.get(API_CONFIG_FIELD_TO_KEY["access_token"], "")),
                 "missing": {
@@ -342,7 +365,7 @@ def fetch_and_store_access_token() -> dict[str, Any]:
     except Exception as exc:
         return {
             "status": "error",
-            "message": f"AccessToken 获取失败：{exc}",
+            "message": f"接口授权获取失败：{exc}",
             "data": {
                 "configured": bool(env_values.get(API_CONFIG_FIELD_TO_KEY["access_token"], "")),
                 "expires_in": env_values.get("WECHAT_STORE_ACCESS_TOKEN_EXPIRES_IN", ""),
@@ -357,7 +380,7 @@ def fetch_and_store_access_token() -> dict[str, Any]:
     if errcode not in (None, 0, "0") or not access_token:
         return {
             "status": "error",
-            "message": errmsg or "微信未返回可保存的 AccessToken。",
+            "message": errmsg or "微信未返回可保存的接口授权。",
             "data": {
                 "configured": bool(env_values.get(API_CONFIG_FIELD_TO_KEY["access_token"], "")),
                 "errcode": errcode,
@@ -382,7 +405,7 @@ def fetch_and_store_access_token() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "message": "AccessToken 已获取并保存到 .env.local。",
+        "message": "接口授权已获取并保存。",
         "data": {
             "configured": True,
             "expires_in": token_updates["WECHAT_STORE_ACCESS_TOKEN_EXPIRES_IN"],
@@ -393,6 +416,84 @@ def fetch_and_store_access_token() -> dict[str, Any]:
             "errmsg": errmsg,
         },
     }
+
+
+def run_configured_api_sync(payload: Mapping[str, Any]) -> dict[str, Any]:
+    env_values = parse_env_file(ENV_LOCAL_PATH)
+    shop_id = clean_config_value(payload.get("shop_id") or env_values.get(API_CONFIG_FIELD_TO_KEY["shop_id"], ""))
+    shop_name = clean_config_value(payload.get("shop_name") or env_values.get(API_CONFIG_FIELD_TO_KEY["shop_name"], ""))
+    access_token = clean_config_value(env_values.get(API_CONFIG_FIELD_TO_KEY["access_token"], ""))
+    api_base_url = clean_api_base_url(env_values.get(API_CONFIG_FIELD_TO_KEY["api_base_url"], "") or DEFAULT_API_BASE_URL)
+    archive_dir = resolve_project_path(
+        clean_config_value(env_values.get(API_CONFIG_FIELD_TO_KEY["raw_archive_dir"], "")) or PROJECT_ROOT / "data" / "raw" / "api"
+    )
+
+    missing = {
+        "shop_id": not bool(shop_id),
+        "access_token": not bool(access_token),
+    }
+    if any(missing.values()):
+        return {
+            "status": "error",
+            "message": "请先完成服务端店铺和接口授权配置，再启动数据同步。",
+            "data": {"missing": missing},
+        }
+
+    try:
+        repo = repository()
+        date_from = clean_config_value(payload.get("date_from") or payload.get("from"))
+        date_to = clean_config_value(payload.get("date_to") or payload.get("to"))
+        sync_run_id = clean_config_value(payload.get("sync_run_id")) or new_id("sync")
+        sync_result = run_wechat_api_sync(
+            db_path=repo.db_path,
+            archive_dir=archive_dir,
+            shop_id=shop_id,
+            shop_name=shop_name or None,
+            date_from=date_from,
+            date_to=date_to,
+            sync_run_id=sync_run_id,
+            access_token=access_token,
+            api_base_url=api_base_url,
+            endpoints=payload.get("endpoints"),
+            page_size=int(payload.get("page_size") or 30),
+            max_pages=int(payload.get("max_pages") or 20),
+            endpoint_params=_api_sync_endpoint_params(payload.get("endpoint_params")),
+        )
+        if sync_result.get("status") == "completed" and parse_bool(payload.get("generate_report", True)):
+            sync_result.update(
+                create_api_sync_report(
+                    db_path=repo.db_path,
+                    reports_dir=repo.reports_dir,
+                    shop_id=shop_id,
+                    date_from=date_from,
+                    date_to=date_to,
+                    sync_run_id=sync_run_id,
+                )
+            )
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"微信小店 API 同步失败：{exc}",
+            "data": {"shop_id": shop_id},
+        }
+    return {"status": "ok", "message": "微信小店 API 同步完成。", "data": sync_result}
+
+
+def _api_sync_endpoint_params(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        str(key): dict(item)
+        for key, item in value.items()
+        if isinstance(item, Mapping)
+    }
+
+
+def resolve_project_path(value: Any) -> str:
+    path = Path(str(value)).expanduser()
+    if path.is_absolute():
+        return str(path)
+    return str(PROJECT_ROOT / path)
 
 
 def start_web_login_browser() -> dict[str, Any]:
@@ -990,7 +1091,7 @@ def render_admin_ui() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>微信小店数据本地管理台</title>
+  <title>微信小店经营分析工作台</title>
   <style>
     :root {
       color-scheme: light;
@@ -1019,12 +1120,12 @@ def render_admin_ui() -> str:
       line-height: 1.45;
     }
     .app-shell {
-      width: min(1320px, 100%);
+      width: min(1280px, 100%);
       margin: 0 auto;
-      padding: 22px;
+      padding: 24px;
       display: grid;
-      grid-template-columns: 220px minmax(0, 1fr);
-      gap: 18px;
+      grid-template-columns: 232px minmax(0, 1fr);
+      gap: 20px;
       align-items: start;
     }
     .side-nav {
@@ -1037,8 +1138,8 @@ def render_admin_ui() -> str:
     }
     .side-nav-header {
       display: grid;
-      gap: 5px;
-      padding: 12px 4px 4px;
+      gap: 6px;
+      padding: 14px 8px 8px;
     }
     .side-nav-title {
       color: var(--text);
@@ -1057,11 +1158,11 @@ def render_admin_ui() -> str:
     }
     .side-nav-item {
       width: 100%;
-      min-height: 46px;
+      min-height: 42px;
       justify-content: flex-start;
       display: grid;
       gap: 2px;
-      padding: 9px 11px;
+      padding: 9px 12px;
       border-color: transparent;
       background: transparent;
       text-align: left;
@@ -1108,7 +1209,7 @@ def render_admin_ui() -> str:
       justify-content: space-between;
       gap: 16px;
       align-items: flex-start;
-      margin-bottom: 18px;
+      margin-bottom: 14px;
     }
     h1 {
       margin: 0 0 6px;
@@ -1171,6 +1272,7 @@ def render_admin_ui() -> str:
       border: 1px solid var(--line);
       border-radius: 8px;
       box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+      margin-bottom: 14px;
     }
     .panel-header {
       display: flex;
@@ -1181,6 +1283,7 @@ def render_admin_ui() -> str:
       border-bottom: 1px solid var(--line);
     }
     .panel-body { padding: 16px; }
+    .context-panel .panel-body { padding: 14px 16px; }
     .stack { display: grid; gap: 14px; }
     .notice-grid {
       display: grid;
@@ -1216,7 +1319,8 @@ def render_admin_ui() -> str:
       font-size: 12px;
       font-weight: 650;
     }
-    input {
+    input,
+    select {
       width: 100%;
       border: 1px solid #cfd7e3;
       border-radius: 7px;
@@ -1228,9 +1332,34 @@ def render_admin_ui() -> str:
       font-size: 13px;
       outline: none;
     }
-    input:focus {
+    input:focus,
+    select:focus {
       border-color: var(--accent);
       box-shadow: 0 0 0 3px rgba(23, 107, 85, 0.12);
+    }
+    .module-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 8px;
+    }
+    .module-option {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 9px 10px;
+      color: #243044;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .module-option input {
+      width: 16px;
+      height: 16px;
+      min-height: 0;
+      padding: 0;
     }
     .full { grid-column: 1 / -1; }
     .checkbox-row {
@@ -1518,7 +1647,6 @@ def render_admin_ui() -> str:
       margin: 0;
       color: var(--text);
       word-break: break-word;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12px;
     }
     .table-wrap {
@@ -1615,17 +1743,37 @@ def render_admin_ui() -> str:
   <main class="app-shell">
     <aside class="side-nav" aria-label="功能菜单">
       <div class="side-nav-header">
-        <div class="side-nav-title">微信小店分析</div>
-        <div class="side-nav-subtitle">订单导出、分析报告，主界面只保留日常要用的入口。</div>
+        <div class="side-nav-title">经营数据中心</div>
+        <div class="side-nav-subtitle">微信小店分析工作台</div>
       </div>
       <nav class="side-nav-items">
-        <button type="button" class="side-nav-item menu-trigger" data-menu-target="taskSection" aria-controls="taskSection">
-          <span>订单导出分析</span>
-          <small>选时间，导订单，生成报告</small>
+        <button type="button" class="side-nav-item menu-trigger" data-menu-target="apiSyncSection" aria-controls="apiSyncSection">
+          <span>数据同步</span>
+          <small>官方接口</small>
+        </button>
+        <button type="button" class="side-nav-item menu-trigger" data-menu-target="authSection" aria-controls="authSection">
+          <span>授权状态</span>
+          <small>只读状态</small>
+        </button>
+        <button type="button" class="side-nav-item menu-trigger" data-menu-target="localExportSection" aria-controls="localExportSection">
+          <span>文件导入</span>
+          <small>Excel / CSV</small>
+        </button>
+        <button type="button" class="side-nav-item menu-trigger" data-menu-target="webOrderSection" aria-controls="webOrderSection">
+          <span>订单导出</span>
+          <small>后台导出</small>
+        </button>
+        <button type="button" class="side-nav-item menu-trigger" data-menu-target="statusSection" aria-controls="statusSection">
+          <span>任务进度</span>
+          <small>同步与分析状态</small>
         </button>
         <button type="button" class="side-nav-item menu-trigger" data-menu-target="recordsSection" aria-controls="recordsSection">
-          <span>分析结果</span>
-          <small>查看最近生成的报告</small>
+          <span>报告中心</span>
+          <small>经营分析结果</small>
+        </button>
+        <button type="button" class="side-nav-item menu-trigger" data-menu-target="capabilitySection" aria-controls="capabilitySection">
+          <span>数据范围</span>
+          <small>可用数据模块</small>
         </button>
       </nav>
       <div class="side-nav-footer">
@@ -1636,8 +1784,8 @@ def render_admin_ui() -> str:
     <section class="main-content">
       <header>
         <div>
-          <h1>微信小店数据本地管理台</h1>
-          <p>先用本地导出文件校验和分析；真实网页采集只跑已校准的订单导出。</p>
+          <h1>经营数据中心</h1>
+          <p>同步微信小店数据，查看任务进度和经营报告。</p>
         </div>
         <div class="top-actions">
           <a class="button-link" href="/login">扫码登录</a>
@@ -1645,25 +1793,18 @@ def render_admin_ui() -> str:
         </div>
       </header>
 
-      <section id="taskSection" class="panel records menu-section" aria-labelledby="orderTaskTitle">
+      <section class="panel records context-panel" aria-labelledby="commonTaskTitle">
         <div class="panel-header">
-          <h2 id="orderTaskTitle">订单真实采集与分析</h2>
-          <button type="button" id="refreshTasks">刷新任务</button>
+          <h2 id="commonTaskTitle">任务信息</h2>
         </div>
-        <div class="panel-body stack">
-          <div class="notice">
-            <strong>网页订单导出</strong>
-            <p>填店铺和日期，确认已扫码登录，再启动。没有 config/shops.json 时也可手填 Shop ID。</p>
-          </div>
-          <form id="orderTaskForm" class="form-grid">
-            <label>
-              Shop ID
-              <input id="collectShopId" name="shop_id" autocomplete="off" placeholder="yijia-baihuo">
-            </label>
-            <label>
-              Shop Name
-              <input id="collectShopName" name="shop_name" autocomplete="off" placeholder="艺家百货甄选店">
-            </label>
+        <div class="panel-body">
+          <div class="form-grid">
+            <input id="collectShopId" name="shop_id" type="hidden">
+            <input id="collectShopName" name="shop_name" type="hidden">
+            <dl id="shopInfoSummary" class="full">
+              <dt>店铺名称</dt><dd>未读取</dd>
+              <dt>店铺 ID</dt><dd>未读取</dd>
+            </dl>
             <label>
               开始日期
               <input id="collectFrom" name="from" type="date" required>
@@ -1672,57 +1813,134 @@ def render_admin_ui() -> str:
               结束日期
               <input id="collectTo" name="to" type="date" required>
             </label>
-            <label class="checkbox-row">
-              <input id="collectHeadless" name="headless" type="checkbox">
-              后台无头运行
-            </label>
-            <div class="button-row">
-              <button type="submit" id="startOrderTask" class="primary">启动订单导出分析</button>
+            <div class="full">
               <span id="taskMessage" class="message"></span>
             </div>
-          </form>
-          <div class="notice">
-            <strong>本地导出文件</strong>
-            <p>把后台导出的 Excel/CSV/zip 放进 data/raw 下的目录，先校验，再复跑分析。</p>
           </div>
+        </div>
+      </section>
+
+      <section id="apiSyncSection" class="panel records menu-section" aria-labelledby="apiSyncTitle">
+        <div class="panel-header">
+          <h2 id="apiSyncTitle">数据同步</h2>
+        </div>
+        <div class="panel-body stack">
+          <div class="notice">
+            <strong>扫码登录只用于订单导出</strong>
+            <p>数据同步需要服务端先完成接口授权；当前页面只展示授权状态，不提供手动填写。</p>
+          </div>
+          <form id="apiSyncForm" class="form-grid">
+            <label class="full">
+              数据模块
+              <div class="module-grid">
+                <label class="module-option"><input type="checkbox" name="api_sync_endpoint" value="products" checked>商品档案</label>
+                <label class="module-option"><input type="checkbox" name="api_sync_endpoint" value="orders" checked>订单明细</label>
+                <label class="module-option"><input type="checkbox" name="api_sync_endpoint" value="aftersale" checked>售后退款</label>
+                <label class="module-option"><input type="checkbox" name="api_sync_endpoint" value="funds" checked>资金流水</label>
+                <label class="module-option"><input type="checkbox" name="api_sync_endpoint" value="compass_shop">店铺经营概览</label>
+                <label class="module-option"><input type="checkbox" name="api_sync_endpoint" value="compass_product">商品表现分析</label>
+                <label class="module-option"><input type="checkbox" name="api_sync_endpoint" value="compass_audience">客户画像</label>
+              </div>
+            </label>
+            <label class="checkbox-row full">
+              <input id="apiSyncGenerateReport" name="generate_report" type="checkbox" checked>
+              完成后生成分析报告
+            </label>
+            <div class="button-row full">
+              <button type="submit" id="startApiSyncTask" class="primary">开始数据同步</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <section id="authSection" class="panel records menu-section" aria-labelledby="authTitle">
+        <div class="panel-header">
+          <h2 id="authTitle">授权状态</h2>
+          <button type="button" id="refreshConfig">刷新状态</button>
+        </div>
+        <div class="panel-body stack">
+          <div class="notice">
+            <strong>此处只展示授权结果</strong>
+            <p>店铺、接口应用和密钥由服务端授权流程维护。普通扫码登录不会返回接口授权。</p>
+          </div>
+          <div class="status-row">
+            <span id="appSecretStatus" class="chip">接口密钥未读取</span>
+            <span id="accessTokenStatus" class="chip">接口授权未读取</span>
+          </div>
+          <dl id="configSummary"></dl>
+          <span id="configMessage" class="message"></span>
+        </div>
+      </section>
+
+      <section id="localExportSection" class="panel records menu-section" aria-labelledby="localExportTitle">
+        <div class="panel-header">
+          <h2 id="localExportTitle">文件导入</h2>
+        </div>
+        <div class="panel-body stack">
           <form id="localExportForm" class="form-grid">
             <label class="full">
-              source_dir
-              <input id="localSourceDir" name="source_dir" autocomplete="off" placeholder="data/raw/collect_yijia-baihuo_2026-06-01_2026-06-03_20260628T094048Z">
+              导出文件夹
+              <input id="localSourceDir" name="source_dir" autocomplete="off" placeholder="例如 /Users/kven/Desktop/微信小店导出">
             </label>
             <label>
-              导入类型
+              文件类型
               <select id="localExportTypes" name="types">
                 <option value="auto">自动识别导出文件</option>
               </select>
             </label>
             <div class="button-row full">
-              <button type="button" id="checkLocalExportTask">校验本地导出文件</button>
-              <button type="submit" id="startLocalExportTask">复跑本地导出文件</button>
-              <span class="hint">例：data/raw/manual-demo。没有 task-metadata.json 也可以用。</span>
+              <button type="button" id="checkLocalExportTask">检查文件</button>
+              <button type="submit" id="startLocalExportTask" class="primary">导入并分析</button>
+              <span class="hint">支持 Excel / CSV。</span>
             </div>
           </form>
-          <div class="notice">
-            <strong>模块能力</strong>
-            <p>绿色表示可用；未校准的网页模块请先走本地导入。</p>
-          </div>
-          <div id="capabilityMessage" class="message">读取 /capabilities 中...</div>
+        </div>
+      </section>
+
+      <section id="webOrderSection" class="panel records menu-section" aria-labelledby="orderTaskTitle">
+        <div class="panel-header">
+          <h2 id="orderTaskTitle">订单导出</h2>
+        </div>
+        <div class="panel-body stack">
+          <form id="orderTaskForm" class="form-grid">
+            <div class="button-row full">
+              <button type="submit" id="startOrderTask" class="primary">启动订单导出</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <section id="capabilitySection" class="panel records menu-section" aria-labelledby="capabilityTitle">
+        <div class="panel-header">
+          <h2 id="capabilityTitle">数据范围</h2>
+        </div>
+        <div class="panel-body stack">
+          <div id="capabilityMessage" class="message">读取数据范围中...</div>
           <div id="capabilitiesPanel" class="capability-grid"></div>
+        </div>
+      </section>
+
+      <section id="statusSection" class="panel records menu-section" aria-labelledby="statusTitle">
+        <div class="panel-header">
+          <h2 id="statusTitle">任务进度</h2>
+          <button type="button" id="refreshTasks">刷新进度</button>
+        </div>
+        <div class="panel-body stack">
           <div class="status-row">
-            <span id="taskStateChip" class="chip">任务未启动</span>
-            <span id="taskReportChip" class="chip">报告未生成</span>
+            <span id="taskStateChip" class="chip">暂无任务</span>
+            <span id="taskReportChip" class="chip">暂无报告</span>
           </div>
           <dl id="taskSummary"></dl>
           <div id="taskSteps" class="task-steps"></div>
-          <div id="taskResult" class="result-box">还没有从页面启动过真实订单采集。</div>
+          <div id="taskResult" class="result-box">暂无任务结果。</div>
           <div id="reportPreview" class="result-box report-preview hidden"></div>
         </div>
       </section>
 
       <section id="recordsSection" class="panel records menu-section" aria-labelledby="recordsTitle">
         <div class="panel-header">
-          <h2 id="recordsTitle">分析结果</h2>
-          <button type="button" id="refreshRecords">刷新结果</button>
+          <h2 id="recordsTitle">报告中心</h2>
+          <button type="button" id="refreshRecords">刷新报告</button>
         </div>
         <div class="panel-body">
           <div id="recordsMessage" class="message">读取分析结果中...</div>
@@ -1737,13 +1955,13 @@ def render_admin_ui() -> str:
     const state = { activeRecords: "tasks", activeTaskId: null, taskPoller: null, capabilities: [] };
     const $ = (id) => document.getElementById(id);
     const taskStepLabels = {
-      collect: "导出/本地文件",
-      import_metadata: "导入任务",
-      import_files: "导入数据",
+      collect: "获取数据",
+      import_metadata: "登记任务",
+      import_files: "整理数据",
       analyze: "计算指标",
       report: "生成报告",
     };
-    const defaultLocalExportDir = "data/raw/collect_yijia-baihuo_2026-06-01_2026-06-03_20260628T094048Z";
+    const defaultLocalExportDir = "";
 
     async function fetchJson(url, options) {
       const response = await fetch(url, options);
@@ -1783,10 +2001,10 @@ def render_admin_ui() -> str:
       el.className = `chip ${configured ? "ok" : "bad"}`;
     }
 
-    function selectMenuSection(targetId = "taskSection") {
+    function selectMenuSection(targetId = "apiSyncSection") {
       const sections = document.querySelectorAll(".menu-section");
       const triggers = document.querySelectorAll(".side-nav-item");
-      const target = $(targetId) ? targetId : "taskSection";
+      const target = $(targetId) ? targetId : "apiSyncSection";
       sections.forEach((section) => {
         section.classList.toggle("menu-hidden", section.id !== target);
       });
@@ -1814,95 +2032,29 @@ def render_admin_ui() -> str:
     }
 
     async function loadConfig() {
-      if (!$("configForm")) return;
-      setMessage("configMessage", "读取 /api-config 中...");
+      if (!$("configSummary")) return;
+      setMessage("configMessage", "读取授权状态中...");
       try {
         const data = await fetchJson("/api-config");
-        $("appId").value = data.values.app_id || "";
-        $("apiBaseUrl").value = data.values.api_base_url || "";
-        $("rawArchiveDir").value = data.values.raw_archive_dir || "";
-        $("syncDryRun").checked = Boolean(data.values.sync_dry_run);
-        $("shopId").value = data.values.shop_id || "";
-        $("shopName").value = data.values.shop_name || "";
         $("collectShopId").value = $("collectShopId").value || data.values.shop_id || "";
         $("collectShopName").value = $("collectShopName").value || data.values.shop_name || "";
-        $("appSecret").value = "";
-        $("accessToken").value = "";
+        renderDefinitionList("shopInfoSummary", [
+          ["店铺名称", data.values.shop_name || "未配置"],
+          ["店铺 ID", data.values.shop_id || "未配置"],
+        ]);
 
-        statusChip("appSecretStatus", "AppSecret", data.secrets.app_secret.configured);
-        statusChip("accessTokenStatus", "AccessToken", data.secrets.access_token.configured);
+        statusChip("appSecretStatus", "接口密钥", data.secrets.app_secret.configured);
+        statusChip("accessTokenStatus", "接口授权", data.secrets.access_token.configured);
         const tokenStatus = data.secrets.access_token || {};
         renderDefinitionList("configSummary", [
-          [".env.local", data.exists ? "已创建" : "未创建"],
-          ["Env Path", data.env_path],
-          ["AppID", data.values.app_id || "未填写"],
-          ["Base URL", data.values.api_base_url || "未填写"],
-          ["Raw Dir", data.values.raw_archive_dir || "未填写"],
-          ["Dry Run", data.values.sync_dry_run ? "true" : "false"],
-          ["Shop", data.values.shop_name || data.values.shop_id || "未填写"],
-          ["Token Source", tokenStatus.source || "未获取"],
-          ["Token Expires", tokenStatus.expires_at || "未获取"],
+          ["店铺", data.values.shop_name || data.values.shop_id || "未填写"],
+          ["接口应用", data.values.app_id ? "已配置" : "未配置"],
+          ["授权状态", tokenStatus.configured ? "已获取" : "未获取"],
+          ["有效期至", tokenStatus.expires_at || "未获取"],
         ]);
-        setMessage("configMessage", "配置已加载，密钥输入框已清空。", "ok");
+        setMessage("configMessage", "授权状态已刷新。", "ok");
       } catch (error) {
         setMessage("configMessage", error.message, "error");
-      }
-    }
-
-    async function saveConfig(event) {
-      event.preventDefault();
-      setMessage("configMessage", "保存配置中...");
-      const payload = {
-        app_id: $("appId").value,
-        app_secret: $("appSecret").value,
-        access_token: $("accessToken").value,
-        api_base_url: $("apiBaseUrl").value,
-        sync_dry_run: $("syncDryRun").checked,
-        raw_archive_dir: $("rawArchiveDir").value,
-        shop_id: $("shopId").value,
-        shop_name: $("shopName").value,
-      };
-      try {
-        await fetchJson("/api-config", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        await loadConfig();
-        setMessage("configMessage", "配置已保存。留空的 AppSecret/AccessToken 已保留旧值。", "ok");
-      } catch (error) {
-        setMessage("configMessage", error.message, "error");
-      }
-    }
-
-    function setTokenResult(text, kind = "") {
-      const el = $("tokenResult");
-      el.textContent = text;
-      el.className = `result-box ${kind}`.trim();
-    }
-
-    async function fetchAccessToken() {
-      setTokenResult("正在请求 /api-token/fetch...");
-      try {
-        const response = await fetch("/api-token/fetch", { method: "POST" });
-        const payload = await response.json();
-        const data = payload.data || {};
-        if (!response.ok || payload.status === "error") {
-          const errcodeText = data.errcode === undefined || data.errcode === null ? "" : ` errcode=${data.errcode}`;
-          setTokenResult(`${payload.message || "AccessToken 获取失败。"}${errcodeText}`, "error");
-          await loadConfig();
-          return;
-        }
-        const parts = [
-          "AccessToken 已保存。",
-          `source=${data.source || "unknown"}`,
-          `expires_in=${data.expires_in || "-"}`,
-          `expires_at=${data.expires_at || "-"}`,
-        ];
-        setTokenResult(parts.join(" "), "ok");
-        await loadConfig();
-      } catch (error) {
-        setTokenResult(error.message, "error");
       }
     }
 
@@ -1945,13 +2097,13 @@ def render_admin_ui() -> str:
     }
 
     async function loadCapabilities() {
-      setMessage("capabilityMessage", "读取 /capabilities 中...");
+      setMessage("capabilityMessage", "读取数据范围中...");
       try {
         const capabilities = await fetchJson("/capabilities");
         state.capabilities = capabilities || [];
         renderCapabilities(state.capabilities);
         renderLocalExportTypeOptions(state.capabilities);
-        setMessage("capabilityMessage", "模块能力已加载。", "ok");
+        setMessage("capabilityMessage", "数据范围已加载。", "ok");
       } catch (error) {
         setMessage("capabilityMessage", error.message, "error");
       }
@@ -1973,25 +2125,21 @@ def render_admin_ui() -> str:
     function renderCapabilities(capabilities) {
       const el = $("capabilitiesPanel");
       if (!capabilities || !capabilities.length) {
-        el.innerHTML = '<div class="empty">暂无模块能力</div>';
+        el.innerHTML = '<div class="empty">暂无数据范围</div>';
         return;
       }
       el.innerHTML = capabilities.map((item) => {
         const webClass = item.web_enabled ? "ok" : "bad";
         const importClass = item.import_enabled ? "ok" : "bad";
-        const calibratedClass = item.calibrated ? "ok" : "bad";
         return `
           <div class="capability-item">
             <div class="capability-title">
               <strong>${escapeHtml(item.label || item.export_type)}</strong>
-              <code>${escapeHtml(item.export_type)}</code>
             </div>
             <div class="status-row">
-              <span class="chip ${webClass}">网页${item.web_enabled ? "已开放" : "待校准"}</span>
-              <span class="chip ${importClass}">导入${item.import_enabled ? "可用" : "未开放"}</span>
-              <span class="chip ${calibratedClass}">${item.calibrated ? "已校准" : "未校准"}</span>
+              <span class="chip ${importClass}">${item.import_enabled ? "支持文件导入" : "暂不支持文件导入"}</span>
+              <span class="chip ${webClass}">${item.web_enabled ? "支持订单导出" : "无需订单导出"}</span>
             </div>
-            <div class="capability-notes">${escapeHtml(item.notes || "")}</div>
           </div>
         `;
       }).join("");
@@ -2020,11 +2168,11 @@ def render_admin_ui() -> str:
       const inspectionHtml = renderImportInspection(inspection.source_inspections || []);
       const warnings = (result.warnings || []).slice(0, 5);
       const warningHtml = warnings.length
-        ? `<ol class="warning-list">${warnings.map((warning) => `<li>${escapeHtml(warning.code || "warning")}：${escapeHtml(warning.message || "")}</li>`).join("")}</ol>`
-        : '<p>没有导入警告。</p>';
+        ? `<ol class="warning-list">${warnings.map((warning) => `<li>${escapeHtml(warning.message || "需要人工复核")}</li>`).join("")}</ol>`
+        : '<p>没有需要复核的项目。</p>';
       setTaskResultHtml(`
         <div class="check-summary">
-          <div><strong>本地导出校验完成</strong> · ${escapeHtml(result.mode || "check_only")} · warnings=${escapeHtml(String(counts.warnings || 0))}</div>
+          <div><strong>文件检查完成</strong> · 需复核 ${escapeHtml(String(counts.warnings || 0))} 项</div>
           <div class="metric-grid">${metricCards}</div>
           ${readinessHtml}
           ${inspectionHtml}
@@ -2037,8 +2185,39 @@ def render_admin_ui() -> str:
       const nonZeroCounts = Object.entries(tables || {})
         .filter(([, value]) => Number(value || 0) > 0);
       return nonZeroCounts.length
-        ? nonZeroCounts.map(([table, value]) => `<div class="metric-card"><strong>${escapeHtml(String(value))}</strong><span>${escapeHtml(table)}</span></div>`).join("")
+        ? nonZeroCounts.map(([table, value]) => `<div class="metric-card"><strong>${escapeHtml(String(value))}</strong><span>${escapeHtml(tableLabel(table))}</span></div>`).join("")
         : '<div class="metric-card"><strong>0</strong><span>可识别数据行</span></div>';
+    }
+
+    function tableLabel(table) {
+      const labels = {
+        orders: "订单",
+        order_items: "订单商品",
+        products: "商品",
+        product_skus: "商品规格",
+        refunds: "售后退款",
+        reviews: "评价",
+        shop_daily: "店铺概览",
+        product_daily: "商品表现",
+        traffic_sources: "流量来源",
+        fund_flows: "资金流水",
+        ad_spend: "投放消耗",
+        audience_insights: "人群画像",
+      };
+      return labels[table] || table || "-";
+    }
+
+    function fieldLabel(field) {
+      const labels = {
+        order_id: "订单编号",
+        product_id: "商品编号",
+        sku_id: "规格编号",
+        pay_amount: "支付金额",
+        refund_amount: "退款金额",
+        created_at: "创建时间",
+        paid_at: "支付时间",
+      };
+      return labels[field] || "必要字段";
     }
 
     function renderBusinessReadiness(items) {
@@ -2048,8 +2227,7 @@ def render_admin_ui() -> str:
       const rows = items.map((item) => {
         const status = item.status || "blocked";
         const chipClass = status === "supported" ? "ok" : "bad";
-        const missing = (item.missing || []).length ? `缺口：${item.missing.join("、")}` : "";
-        const decisions = (item.limited_decisions || []).slice(0, 2).join(" ");
+        const missing = (item.missing || []).length ? `待补充：${item.missing.map(tableLabel).join("、")}` : "";
         return `
           <div class="readiness-panel">
             <div class="readiness-panel-header">
@@ -2058,7 +2236,6 @@ def render_admin_ui() -> str:
             </div>
             <div class="readiness-summary">${escapeHtml(item.summary || "")}</div>
             ${missing ? `<div class="inspection-meta">${escapeHtml(missing)}</div>` : ""}
-            ${decisions ? `<div class="inspection-meta">${escapeHtml(decisions)}</div>` : ""}
           </div>
         `;
       }).join("");
@@ -2067,34 +2244,32 @@ def render_admin_ui() -> str:
 
     function renderImportInspection(items) {
       if (!items.length) {
-        return '<div class="inspection-list"><div class="inspection-item"><strong>未生成文件级校验明细</strong><div class="inspection-meta">当前结果只有总行数和 warning。</div></div></div>';
+        return '<div class="inspection-list"><div class="inspection-item"><strong>暂无文件明细</strong><div class="inspection-meta">当前只返回了汇总结果。</div></div></div>';
       }
       const rows = items.map((item) => {
-        const table = item.selected_table || item.guessed_table || "未识别";
+        const table = tableLabel(item.selected_table || item.guessed_table || "未识别");
         const status = item.status || "unknown";
         const rowCounts = item.row_counts || {};
         const derived = rowCounts.derived_tables || {};
         const derivedText = Object.entries(derived)
           .filter(([, value]) => Number(value || 0) > 0)
-          .map(([name, value]) => `${name}=${value}`)
+          .map(([name, value]) => `${tableLabel(name)} ${value}`)
           .join("，");
         const missingColumns = (item.missing_required_columns || []).join("、");
         const missingValues = (item.missing_required_values || [])
-          .map((entry) => `${entry.field} 缺 ${entry.count} 行`)
+          .map((entry) => `${fieldLabel(entry.field)}缺少 ${entry.count} 行`)
           .join("，");
-        const fields = (item.field_matches || []).slice(0, 12).map((field) => (
-          `<span class="chip">${escapeHtml(field.field)} ← ${escapeHtml(field.header)} · ${escapeHtml(field.match_method || "")}</span>`
-        )).join("");
+        const matchedFieldCount = (item.field_matches || []).length;
         return `
           <div class="inspection-item">
             <div class="inspection-item-header">
               <strong>${escapeHtml(table)} · ${escapeHtml(shortFileName(item.source_file || ""))}${item.source_sheet ? ` / ${escapeHtml(item.source_sheet)}` : ""}</strong>
               <span class="chip ${status === "importable" ? "ok" : status === "needs_review" ? "" : "bad"}">${escapeHtml(statusLabel(status))}</span>
             </div>
-            <div class="inspection-meta">识别依据：${escapeHtml(item.selected_reason || "-")} · 原始行 ${escapeHtml(String(rowCounts.raw_rows ?? 0))} · 可导入 ${escapeHtml(String(rowCounts.imported_rows ?? 0))}${derivedText ? ` · 派生 ${escapeHtml(derivedText)}` : ""}</div>
-            ${fields ? `<div class="field-match-list">${fields}</div>` : '<div class="inspection-meta">没有匹配到标准字段。</div>'}
-            ${missingColumns ? `<div class="inspection-meta">缺关键列：${escapeHtml(missingColumns)}</div>` : ""}
-            ${missingValues ? `<div class="inspection-meta">缺关键值：${escapeHtml(missingValues)}</div>` : ""}
+            <div class="inspection-meta">文件行数 ${escapeHtml(String(rowCounts.raw_rows ?? 0))} · 可导入 ${escapeHtml(String(rowCounts.imported_rows ?? 0))}${derivedText ? ` · 关联数据 ${escapeHtml(derivedText)}` : ""}</div>
+            ${matchedFieldCount ? `<div class="inspection-meta">已识别字段 ${escapeHtml(String(matchedFieldCount))} 个</div>` : '<div class="inspection-meta">没有匹配到可用字段。</div>'}
+            ${missingColumns ? `<div class="inspection-meta">缺少必要列：${escapeHtml(missingColumns)}</div>` : ""}
+            ${missingValues ? `<div class="inspection-meta">缺少必要值：${escapeHtml(missingValues)}</div>` : ""}
           </div>
         `;
       }).join("");
@@ -2105,12 +2280,18 @@ def render_admin_ui() -> str:
       const labels = {
         supported: "可支持",
         limited: "受限",
-        blocked: "缺数据",
+        blocked: "资料不足",
         importable: "可导入",
         needs_review: "需复核",
         skipped: "已跳过",
         unrecognized: "未识别",
         empty: "空表",
+        queued: "排队中",
+        running: "处理中",
+        pending: "等待中",
+        completed: "已完成",
+        failed: "失败",
+        unknown: "未知",
       };
       return labels[status] || status || "-";
     }
@@ -2121,9 +2302,9 @@ def render_admin_ui() -> str:
 
     function renderTask(task) {
       if (!task) {
-        $("taskStateChip").textContent = "任务未启动";
+        $("taskStateChip").textContent = "暂无任务";
         $("taskStateChip").className = "chip";
-        $("taskReportChip").textContent = "报告未生成";
+        $("taskReportChip").textContent = "暂无报告";
         $("taskReportChip").className = "chip";
         $("taskSummary").innerHTML = "";
         renderTaskSteps({});
@@ -2132,19 +2313,17 @@ def render_admin_ui() -> str:
       const stateText = task.state || task.status || "unknown";
       const isOk = stateText === "completed";
       const isBad = stateText === "failed";
-      $("taskStateChip").textContent = `任务 ${stateText}`;
+      $("taskStateChip").textContent = `任务 ${statusLabel(stateText)}`;
       $("taskStateChip").className = `chip ${isOk ? "ok" : isBad ? "bad" : ""}`.trim();
 
       const reportId = task.result?.report?.report_id || "";
-      $("taskReportChip").textContent = reportId ? `报告 ${reportId}` : "报告未生成";
+      $("taskReportChip").textContent = reportId ? `报告 ${reportId}` : "暂无报告";
       $("taskReportChip").className = `chip ${reportId ? "ok" : isBad ? "bad" : ""}`.trim();
       renderDefinitionList("taskSummary", [
-        ["Task ID", task.id || task.task_id],
-        ["采集任务", task.collection_task_id || "-"],
+        ["任务", task.task_name || task.source_type || "-"],
         ["店铺", task.shop_name_snapshot || task.shop_id || "-"],
-        ["日期", `${task.date_range?.from || "-"} 至 ${task.date_range?.to || "-"}`],
-        ["状态", stateText],
-        ["原始目录", task.result?.source_dir || task.source_dir || "-"],
+        ["周期", `${task.date_range?.from || "-"} 至 ${task.date_range?.to || "-"}`],
+        ["状态", statusLabel(stateText)],
         ["报告", reportId || "-"],
       ]);
       renderTaskSteps(task.steps || {});
@@ -2158,7 +2337,7 @@ def render_admin_ui() -> str:
           const tables = importInspection.totals?.tables || {};
           setTaskResultHtml(`
             <div class="check-summary">
-              <div><strong>任务已完成</strong> · ${escapeHtml(task.source_type || "task")} · warnings=${escapeHtml(String(counts.warnings || 0))}</div>
+              <div><strong>任务已完成</strong> · 需复核 ${escapeHtml(String(counts.warnings || 0))} 项</div>
               <div class="metric-grid">${renderMetricCards(tables)}</div>
               ${renderBusinessReadiness(importInspection.business_readiness || [])}
               ${renderImportInspection(importInspection.source_inspections || [])}
@@ -2167,14 +2346,12 @@ def render_admin_ui() -> str:
           return;
         }
         const parts = [
-          `导出/导入文件数：${task.result.artifact_count ?? "-"}`,
-          `analysis_run_id：${task.result.analysis_run_id || "-"}`,
-          `report_id：${reportId || "-"}`,
-          `source_dir：${task.result.source_dir || "-"}`,
+          `处理文件数：${task.result.artifact_count ?? "-"}`,
+          `报告编号：${reportId || "-"}`,
         ];
         setTaskResult(parts.join("\\n"), "ok");
       } else {
-        setTaskResult(task.source_type === "local_export" ? "本地导出文件正在导入、分析并生成报告。" : "任务正在执行，请保持微信后台登录态有效。");
+        setTaskResult(task.source_type === "local_export" ? "文件正在导入、分析并生成报告。" : "任务正在执行，请保持登录状态有效。");
       }
     }
 
@@ -2183,7 +2360,7 @@ def render_admin_ui() -> str:
         const step = steps[key] || {};
         const status = step.status || "pending";
         const detail = step.error || step.completed_at || step.started_at || "";
-        return `<div class="task-step ${escapeHtml(status)}"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(status)}${detail ? ` · ${escapeHtml(String(detail))}` : ""}</span></div>`;
+        return `<div class="task-step ${escapeHtml(status)}"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(statusLabel(status))}${detail ? ` · ${escapeHtml(String(detail))}` : ""}</span></div>`;
       }).join("");
     }
 
@@ -2200,22 +2377,22 @@ def render_admin_ui() -> str:
       event.preventDefault();
       const loginStatus = await fetchJson("/web-login/status");
       if (loginStatus.process_running) {
-        setMessage("taskMessage", "扫码登录窗口仍在运行，请先关闭官方后台登录窗口，再启动采集。", "error");
+        setMessage("taskMessage", "扫码登录窗口仍在运行，请先关闭官方后台登录窗口，再启动订单导出。", "error");
         return;
       }
       const payload = {
         shop_id: $("collectShopId").value,
-        task_name: "订单真实导出分析",
+        task_name: "订单导出分析",
         source_type: "web_export",
         params: {
           shop_name: $("collectShopName").value,
           from: $("collectFrom").value,
           to: $("collectTo").value,
           types: ["orders"],
-          headless: $("collectHeadless").checked,
+          headless: false,
         },
       };
-      setMessage("taskMessage", "正在启动真实订单采集任务...");
+      setMessage("taskMessage", "正在启动订单导出任务...");
       try {
         const task = await fetchJson("/tasks", {
           method: "POST",
@@ -2224,7 +2401,8 @@ def render_admin_ui() -> str:
         });
         state.activeTaskId = task.id || task.task_id;
         renderTask(task);
-        setMessage("taskMessage", "任务已启动，正在轮询进度。", "ok");
+        selectMenuSection("statusSection");
+        setMessage("taskMessage", "任务已启动，正在更新进度。", "ok");
         startTaskPolling(state.activeTaskId);
       } catch (error) {
         setMessage("taskMessage", error.message, "error");
@@ -2233,17 +2411,17 @@ def render_admin_ui() -> str:
 
     async function startLocalExportTask(event) {
       event.preventDefault();
-      await submitLocalExportTask("/tasks", "正在复跑本地导出文件...", "本地复跑任务已启动，正在轮询进度。", true);
+      await submitLocalExportTask("/tasks", "正在导入文件...", "文件导入任务已启动，正在更新进度。", true);
     }
 
     async function checkLocalExportTask() {
-      await submitLocalExportTask("/tasks/local-export/check", "正在校验本地导出文件...", "本地导出文件校验完成。", false);
+      await submitLocalExportTask("/tasks/local-export/check", "正在检查文件...", "文件检查完成。", false);
     }
 
     async function submitLocalExportTask(url, pendingMessage, successMessage, shouldPoll) {
       const payload = {
         shop_id: $("collectShopId").value,
-        task_name: "本地导出复跑分析",
+        task_name: "文件导入分析",
         source_type: "local_export",
         params: {
           mode: "local_export",
@@ -2264,14 +2442,67 @@ def render_admin_ui() -> str:
         if (shouldPoll) {
           state.activeTaskId = task.id || task.task_id;
           renderTask(task);
+          selectMenuSection("statusSection");
           startTaskPolling(state.activeTaskId);
         } else {
           renderLocalExportCheckResult(task);
+          selectMenuSection("statusSection");
         }
         setMessage("taskMessage", successMessage, "ok");
       } catch (error) {
         setMessage("taskMessage", error.message, "error");
       }
+    }
+
+    function selectedApiSyncEndpoints() {
+      return [...document.querySelectorAll('input[name="api_sync_endpoint"]:checked')]
+        .map((item) => item.value)
+        .filter(Boolean);
+    }
+
+    async function startApiSyncTask(event) {
+      event.preventDefault();
+      const payload = {
+        shop_id: $("collectShopId").value,
+        shop_name: $("collectShopName").value,
+        date_from: $("collectFrom").value,
+        date_to: $("collectTo").value,
+        endpoints: selectedApiSyncEndpoints(),
+        generate_report: $("apiSyncGenerateReport").checked,
+      };
+      setMessage("taskMessage", "正在同步数据...");
+      try {
+        const result = await fetchJson("/api-sync/runs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        renderApiSyncResult(result);
+        selectMenuSection("statusSection");
+        if (result.report?.report_id) {
+          await loadReportPreview(result.report.report_id);
+        }
+        await loadRecords();
+        setMessage("taskMessage", "数据同步完成。", "ok");
+      } catch (error) {
+        setMessage("taskMessage", error.message, "error");
+      }
+    }
+
+    function renderApiSyncResult(result) {
+      const rows = (result.items || []).reduce((sum, item) => sum + Number(item.row_count || 0), 0);
+      const reportId = result.report?.report_id || "-";
+      const moduleCount = new Set((result.items || []).map((item) => item.table_hint || item.export_type || item.endpoint)).size;
+      setTaskResultHtml(`
+        <div class="check-summary">
+          <div><strong>数据同步完成</strong></div>
+          <div class="metric-grid">
+            <div class="metric-card"><strong>${escapeHtml(String(moduleCount))}</strong><span>同步模块</span></div>
+            <div class="metric-card"><strong>${escapeHtml(String(rows))}</strong><span>写入记录</span></div>
+            <div class="metric-card"><strong>${escapeHtml(reportId)}</strong><span>分析报告</span></div>
+          </div>
+        </div>
+      `, result.status === "completed" ? "ok" : "error");
     }
 
     function startTaskPolling(taskId) {
@@ -2315,7 +2546,7 @@ def render_admin_ui() -> str:
     }
 
     async function loadTasks() {
-      setMessage("taskMessage", "读取采集任务中...");
+      setMessage("taskMessage", "读取任务进度中...");
       try {
         const tasks = await fetchJson("/tasks");
         const latest = (tasks || [])[0];
@@ -2324,7 +2555,7 @@ def render_admin_ui() -> str:
         } else if (!state.activeTaskId) {
           renderTask(null);
         }
-        setMessage("taskMessage", "采集任务已刷新。", "ok");
+        setMessage("taskMessage", "任务进度已刷新。", "ok");
       } catch (error) {
         setMessage("taskMessage", error.message, "error");
       }
@@ -2394,20 +2625,19 @@ def render_admin_ui() -> str:
 
     async function refreshAll() {
       setDefaultDates();
-      await Promise.all([loadCapabilities(), loadTasks(), loadRecords()]);
+      await Promise.all([loadConfig(), loadCapabilities(), loadTasks(), loadRecords()]);
     }
 
-    $("configForm")?.addEventListener("submit", saveConfig);
     $("refreshHealth")?.addEventListener("click", loadHealth);
     $("refreshConfig")?.addEventListener("click", loadConfig);
     $("refreshWebLogin")?.addEventListener("click", loadWebLoginStatus);
     $("refreshRecords")?.addEventListener("click", loadRecords);
     $("refreshAll")?.addEventListener("click", refreshAll);
-    $("fetchAccessToken")?.addEventListener("click", fetchAccessToken);
     $("openWebLogin")?.addEventListener("click", openWebLogin);
     $("orderTaskForm")?.addEventListener("submit", startOrderTask);
     $("localExportForm")?.addEventListener("submit", startLocalExportTask);
     $("checkLocalExportTask")?.addEventListener("click", checkLocalExportTask);
+    $("apiSyncForm")?.addEventListener("submit", startApiSyncTask);
     $("refreshTasks")?.addEventListener("click", loadTasks);
     document.querySelectorAll(".side-nav-item").forEach((trigger) => {
       trigger.addEventListener("click", () => selectMenuSection(trigger.dataset.menuTarget));
@@ -2418,7 +2648,7 @@ def render_admin_ui() -> str:
       setMessage("configMessage", "密钥输入框已清空；保存时会保留旧值。");
     });
 
-    selectMenuSection("taskSection");
+    selectMenuSection("apiSyncSection");
     refreshAll();
   </script>
 </body>

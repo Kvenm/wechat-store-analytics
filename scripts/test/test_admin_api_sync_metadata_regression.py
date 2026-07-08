@@ -44,6 +44,7 @@ def main() -> int:
     tests: tuple[Callable[[], None], ...] = (
         test_repository_lists_sync_metadata_with_filters_and_redaction,
         test_admin_route_functions_return_sync_metadata,
+        test_admin_route_starts_configured_api_sync_without_leaking_token,
         test_empty_database_and_missing_run_do_not_raise,
     )
 
@@ -142,6 +143,74 @@ def test_admin_route_functions_return_sync_metadata() -> None:
             assert_no_sensitive_text(raw_response)
         finally:
             admin_app.repository = original_repository
+
+
+def test_admin_route_starts_configured_api_sync_without_leaking_token() -> None:
+    token = "admin-route-token-must-not-leak"
+    calls: list[dict[str, Any]] = []
+
+    def fake_sync(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "sync_run_id": kwargs["sync_run_id"],
+            "shop_id": kwargs["shop_id"],
+            "source_kind": "api_pull",
+            "connector": "wechat_api",
+            "status": "completed",
+            "items": [],
+            "warnings": [],
+        }
+
+    with tempfile.TemporaryDirectory(prefix="wechat_admin_api_sync_start_") as temp_dir:
+        temp_path = Path(temp_dir)
+        env_path = temp_path / ".env.local"
+        env_path.write_text(
+            "\n".join(
+                [
+                    "WECHAT_STORE_ACCESS_TOKEN=admin-route-token-must-not-leak",
+                    "WECHAT_STORE_API_BASE_URL=https://api.example.test/",
+                    "WECHAT_STORE_RAW_ARCHIVE_DIR=data/raw/api-test",
+                    "WECHAT_STORE_SHOP_ID=config-shop",
+                    "WECHAT_STORE_SHOP_NAME=Config Shop",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        repo = LocalRepository(db_path=temp_path / "warehouse.sqlite", reports_dir=temp_path / "reports")
+        original_env_path = admin_app.ENV_LOCAL_PATH
+        original_repository = admin_app.repository
+        original_sync = admin_app.run_wechat_api_sync
+        admin_app.ENV_LOCAL_PATH = env_path
+        admin_app.repository = lambda: repo
+        admin_app.run_wechat_api_sync = fake_sync
+        try:
+            result = admin_app.create_api_sync_run(
+                admin_app.ApiSyncRunRequest(
+                    shop_id="payload-shop",
+                    date_from="2026-06-01",
+                    date_to="2026-06-02",
+                    endpoints=["orders"],
+                    endpoint_params={"orders": {"status": 20}},
+                )
+            )
+        finally:
+            admin_app.ENV_LOCAL_PATH = original_env_path
+            admin_app.repository = original_repository
+            admin_app.run_wechat_api_sync = original_sync
+
+        assert result["status"] == "ok"
+        assert calls and calls[0]["shop_id"] == "payload-shop"
+        assert calls[0]["access_token"] == token
+        assert calls[0]["api_base_url"] == "https://api.example.test"
+        assert calls[0]["archive_dir"] == str(PROJECT_ROOT / "data" / "raw" / "api-test")
+        assert calls[0]["endpoints"] == ["orders"]
+        assert calls[0]["endpoint_params"] == {"orders": {"status": 20}}
+        assert result["data"]["analysis_run_id"]
+        assert result["data"]["report"]["report_id"]
+        assert Path(result["data"]["report"]["markdown_path"]).exists()
+        payload = json.dumps(result, ensure_ascii=False, sort_keys=True)
+        assert token not in payload
 
 
 def test_empty_database_and_missing_run_do_not_raise() -> None:

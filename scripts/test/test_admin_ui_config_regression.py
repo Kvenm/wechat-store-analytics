@@ -32,7 +32,9 @@ def main() -> int:
         test_empty_secret_and_token_do_not_overwrite_existing_values,
         test_root_html_contains_core_admin_ui_elements,
         test_root_html_uses_left_menu_sections,
+        test_root_html_contains_auth_settings_entry,
         test_root_html_marks_local_export_entry_frontend_pending,
+        test_root_html_contains_api_sync_entry,
         test_capabilities_exposes_registry_without_secrets,
         test_web_export_accepts_manual_shop_without_shops_json,
         test_web_export_accepts_manual_shop_not_in_shops_json,
@@ -185,25 +187,29 @@ def test_root_html_contains_core_admin_ui_elements() -> None:
     html = response.body.decode("utf-8")
 
     expected_fragments = (
-        "微信小店数据本地管理台",
-        "Shop ID",
-        "Shop Name",
+        "微信小店经营分析工作台",
+        "店铺 ID",
+        "店铺名称",
+        "shopInfoSummary",
+        'id="collectShopId" name="shop_id" type="hidden"',
+        'id="collectShopName" name="shop_name" type="hidden"',
         'href="/login"',
         "扫码登录",
-        "网页订单导出",
-        "启动订单导出分析",
+        "订单导出",
+        "启动订单导出",
         "orderTaskForm",
         "collectFrom",
         "collectTo",
         "startOrderTask",
-        "采集任务",
-        "导出/本地文件",
-        "导入数据",
+        "任务进度",
+        "获取数据",
+        "整理数据",
         "生成报告",
-        "微信小店分析",
+        "经营数据中心",
         "功能菜单",
-        "订单导出分析",
-        "分析结果",
+        "数据同步",
+        "授权状态",
+        "报告中心",
         "reportsPanel",
         "reportDetail",
         "/reports",
@@ -227,10 +233,15 @@ def test_root_html_uses_left_menu_sections() -> None:
     assert 'document.querySelectorAll(".side-nav-item")' in html
     assert 'classList.toggle("menu-hidden"' in html
     assert 'classList.toggle("active"' in html
-    assert 'selectMenuSection("taskSection")' in html
+    assert 'selectMenuSection("apiSyncSection")' in html
 
     expected_sections = {
-        "taskSection",
+        "apiSyncSection",
+        "authSection",
+        "localExportSection",
+        "webOrderSection",
+        "capabilitySection",
+        "statusSection",
         "recordsSection",
     }
     targets = set(re.findall(r'data-menu-target="([^"]+)"', html))
@@ -252,30 +263,112 @@ def test_root_html_uses_left_menu_sections() -> None:
         assert fragment not in html, f"root HTML should not expose admin element: {fragment}"
 
 
+def test_root_html_contains_auth_settings_entry() -> None:
+    response = admin_app.root()
+    html = response.body.decode("utf-8")
+
+    expected_fragments = (
+        "authSection",
+        "授权状态",
+        "扫码登录只用于订单导出",
+        "此处只展示授权结果",
+        "当前页面只展示授权状态，不提供手动填写",
+        "接口密钥未读取",
+        "接口授权未读取",
+        "refreshConfig",
+        "/api-config",
+        "授权状态已刷新",
+    )
+    for fragment in expected_fragments:
+        assert fragment in html, f"root HTML missing auth setting element: {fragment}"
+
+    hidden_fragments = (
+        "接口应用 ID",
+        "保存授权设置",
+        "保存并获取接口授权",
+        "saveAndFetchToken",
+        "buildConfigPayload",
+        'id="appId"',
+        'id="appSecret"',
+    )
+    for fragment in hidden_fragments:
+        assert fragment not in html, f"root HTML should not expose editable auth setting: {fragment}"
+
+
 def test_root_html_marks_local_export_entry_frontend_pending() -> None:
     response = admin_app.root()
     html = response.body.decode("utf-8")
 
     expected_fragments = (
-        "本地导出文件",
-        "先校验，再复跑分析",
+        "文件导入",
+        "localExportSection",
+        "导出文件夹",
+        "支持 Excel / CSV",
         "local_export",
         "source_dir",
         "localExportTypes",
         "自动识别导出文件",
         "capabilitiesPanel",
         "/capabilities",
-        "模块能力",
-        "校验本地导出文件",
+        "数据范围",
+        "检查文件",
+        "导入并分析",
         "/tasks/local-export/check",
         "renderImportInspection",
         "renderBusinessReadiness",
-        "业务能力",
-        "缺关键列",
-        "识别依据",
+        "文件检查完成",
+        "缺少必要列",
+        "已识别字段",
+        "没有匹配到可用字段",
     )
     for fragment in expected_fragments:
         assert fragment in html, f"root HTML missing local export element: {fragment}"
+
+    hidden_fragments = (
+        "识别依据",
+        "缺关键列",
+        "选择已放入导出文件的本地文件夹",
+        "data/raw/collect",
+    )
+    for fragment in hidden_fragments:
+        assert fragment not in html, f"root HTML should not expose local export detail: {fragment}"
+
+
+def test_root_html_contains_api_sync_entry() -> None:
+    response = admin_app.root()
+    html = response.body.decode("utf-8")
+
+    expected_fragments = (
+        "数据同步",
+        "apiSyncSection",
+        "apiSyncForm",
+        'name="api_sync_endpoint"',
+        "apiSyncGenerateReport",
+        "startApiSyncTask",
+        "selectedApiSyncEndpoints",
+        "renderApiSyncResult",
+        "/api-sync/runs",
+        "完成后生成分析报告",
+        "开始数据同步",
+        'value="compass_shop"',
+        'value="compass_product"',
+        'value="compass_audience"',
+        "店铺经营概览",
+        "商品表现分析",
+        "客户画像",
+    )
+    for fragment in expected_fragments:
+        assert fragment in html, f"root HTML missing API sync element: {fragment}"
+
+    hidden_fragments = (
+        "官方 API 同步",
+        "同步后生成报告",
+        "店铺罗盘",
+        "商品罗盘",
+        "可追加 compass_",
+    )
+    for fragment in hidden_fragments:
+        assert fragment not in html, f"root HTML should not expose API sync detail: {fragment}"
 
 
 def test_capabilities_exposes_registry_without_secrets() -> None:
