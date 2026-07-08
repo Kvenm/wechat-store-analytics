@@ -119,7 +119,7 @@ ENDPOINT_SPECS: dict[str, EndpointSpec] = {
         endpoint="/channels/ec/compass/shop/overall/get",
         export_type="products",
         table_hint="shop_daily",
-        date_mode="date_strings",
+        date_mode="compass_ds",
         records_keys=("records", "shop_daily", "data", "list", "items"),
     ),
     "compass_product": EndpointSpec(
@@ -127,7 +127,7 @@ ENDPOINT_SPECS: dict[str, EndpointSpec] = {
         endpoint="/channels/ec/compass/shop/product/list/get",
         export_type="product_daily",
         table_hint="product_daily",
-        date_mode="date_strings",
+        date_mode="compass_ds",
         records_keys=("product_list", "productList", "records", "data", "list", "items"),
     ),
     "compass_audience": EndpointSpec(
@@ -135,7 +135,7 @@ ENDPOINT_SPECS: dict[str, EndpointSpec] = {
         endpoint="/channels/ec/compass/shop/sale/profile/data/get",
         export_type="compass",
         table_hint="audience_insights",
-        date_mode="date_strings",
+        date_mode="compass_ds",
         records_keys=("profile_data", "audience", "records", "data", "list", "items"),
     ),
 }
@@ -176,6 +176,9 @@ RECORD_HINT_KEYS = {
     "review_content",
     "visitor_count",
     "payment_amount",
+    "pay_gmv",
+    "pay_order_cnt",
+    "product_click_uv",
     "spend_amount",
     "segment_label",
 }
@@ -442,6 +445,7 @@ def _pull_endpoint_page(
         http_status, payload = client.post_json(spec.endpoint, request_body, timeout)
         _raise_api_error(payload)
         records, detail_payloads = _records_for_payload(client, spec, payload, timeout)
+        records = [_with_request_context(spec, record, request_body) for record in records]
         records = [_normalize_record_for_table(spec.table_hint, record) for record in records]
         status = "completed"
         error_code = None
@@ -578,6 +582,12 @@ def _request_body(
             body["start_time"] = start_ts
         if end_ts:
             body["end_time"] = end_ts
+    elif spec.date_mode == "compass_ds":
+        body = {"ds": _compact_date(date_from or date_to or "")}
+        if spec.name == "compass_product":
+            body.update({"limit": int(page_size), "offset": max(0, page_number - 1) * int(page_size)})
+        if spec.name == "compass_audience":
+            body["type"] = 3
     elif spec.date_mode == "date_strings":
         if date_from:
             body["start_date"] = date_from
@@ -591,17 +601,25 @@ def _request_body(
     return body
 
 
+def _compact_date(value: str) -> str:
+    return value.replace("-", "")
+
+
 def _date_windows(spec: EndpointSpec, date_from: str | None, date_to: str | None) -> list[tuple[str | None, str | None]]:
-    if spec.date_mode != "aftersale_create_range" or not date_from or not date_to:
+    if spec.date_mode not in {"aftersale_create_range", "order_create_range", "compass_ds"} or not date_from or not date_to:
         return [(date_from, date_to)]
     start = datetime.fromisoformat(date_from).date()
     end = datetime.fromisoformat(date_to).date()
     if end < start:
         return [(date_from, date_to)]
-    return [
-        ((start + timedelta(days=offset)).isoformat(), (start + timedelta(days=offset)).isoformat())
-        for offset in range((end - start).days + 1)
-    ]
+    window_days = 7 if spec.date_mode == "order_create_range" else 1
+    windows = []
+    current = start
+    while current <= end:
+        window_end = min(current + timedelta(days=window_days - 1), end)
+        windows.append((current.isoformat(), window_end.isoformat()))
+        current = window_end + timedelta(days=1)
+    return windows
 
 
 def _records_for_payload(
@@ -681,6 +699,23 @@ def _normalize_record_for_table(table_hint: str, record: Mapping[str, Any]) -> d
     if table_hint == "fund_flows":
         return _normalize_fund_flow_record(row)
     return row
+
+
+def _with_request_context(spec: EndpointSpec, record: Mapping[str, Any], request_body: Mapping[str, Any]) -> Mapping[str, Any]:
+    if spec.date_mode != "compass_ds" or not isinstance(record, Mapping):
+        return record
+    row = dict(record)
+    ds = _text(request_body.get("ds"))
+    if ds and not row.get("stat_date"):
+        row["stat_date"] = _date_from_compact(ds)
+    return row
+
+
+def _date_from_compact(value: str) -> str:
+    text = _text(value)
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    return text
 
 
 def _normalize_order_record(row: dict[str, Any]) -> dict[str, Any]:
@@ -855,6 +890,12 @@ def _fill_generic_defaults(
             row["is_positive"] = "1" if float(row["rating"]) >= 4 else "0"
     elif table == "shop_daily":
         row.setdefault("stat_date", _date_from_source(source_file, source_sheet))
+        row.setdefault("visitor_count", _first_value(raw_row, ("visitor_count", "visitorCount", "pay_uv", "product_click_uv")))
+        row.setdefault("click_user_count", _first_value(raw_row, ("click_user_count", "clickUserCount", "product_click_uv")))
+        row.setdefault("order_count", _first_value(raw_row, ("order_count", "orderCount", "pay_order_cnt")))
+        row.setdefault("buyer_count", _first_value(raw_row, ("buyer_count", "buyerCount", "pay_uv")))
+        row.setdefault("payment_amount", _first_value(raw_row, ("payment_amount", "paymentAmount", "pay_gmv")))
+        row.setdefault("refund_amount", _first_value(raw_row, ("refund_amount", "refundAmount", "pay_refund_gmv")))
     elif table == "product_daily":
         row.setdefault("stat_date", _date_from_source(source_file, source_sheet))
         if not row.get("product_id") and row.get("product_name"):
