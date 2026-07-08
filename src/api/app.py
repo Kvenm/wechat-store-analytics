@@ -438,6 +438,12 @@ def run_configured_api_sync(payload: Mapping[str, Any]) -> dict[str, Any]:
             "message": "请先完成服务端店铺和接口授权配置，再启动数据同步。",
             "data": {"missing": missing},
         }
+    if access_token_needs_refresh(env_values):
+        token_result = fetch_and_store_access_token()
+        if token_result["status"] == "error":
+            return token_result
+        env_values = parse_env_file(ENV_LOCAL_PATH)
+        access_token = clean_config_value(env_values.get(API_CONFIG_FIELD_TO_KEY["access_token"], ""))
 
     try:
         repo = repository()
@@ -477,6 +483,17 @@ def run_configured_api_sync(payload: Mapping[str, Any]) -> dict[str, Any]:
             "data": {"shop_id": shop_id},
         }
     return {"status": "ok", "message": "微信小店 API 同步完成。", "data": sync_result}
+
+
+def access_token_needs_refresh(env_values: Mapping[str, str]) -> bool:
+    expires_at = clean_config_value(env_values.get("WECHAT_STORE_ACCESS_TOKEN_EXPIRES_AT", ""))
+    if not expires_at:
+        return False
+    try:
+        expires_at_dt = datetime.fromisoformat(expires_at.removesuffix("Z"))
+    except ValueError:
+        return True
+    return expires_at_dt <= datetime.utcnow() + timedelta(minutes=5)
 
 
 def _api_sync_endpoint_params(value: Any) -> dict[str, dict[str, Any]]:

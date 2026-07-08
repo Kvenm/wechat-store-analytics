@@ -45,6 +45,7 @@ def main() -> int:
         test_repository_lists_sync_metadata_with_filters_and_redaction,
         test_admin_route_functions_return_sync_metadata,
         test_admin_route_starts_configured_api_sync_without_leaking_token,
+        test_admin_route_refreshes_expired_token_before_sync,
         test_empty_database_and_missing_run_do_not_raise,
     )
 
@@ -211,6 +212,62 @@ def test_admin_route_starts_configured_api_sync_without_leaking_token() -> None:
         assert Path(result["data"]["report"]["markdown_path"]).exists()
         payload = json.dumps(result, ensure_ascii=False, sort_keys=True)
         assert token not in payload
+
+
+def test_admin_route_refreshes_expired_token_before_sync() -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_sync(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "sync_run_id": kwargs["sync_run_id"],
+            "shop_id": kwargs["shop_id"],
+            "source_kind": "api_pull",
+            "connector": "wechat_api",
+            "status": "completed",
+            "items": [],
+            "warnings": [],
+        }
+
+    with tempfile.TemporaryDirectory(prefix="wechat_admin_api_sync_refresh_") as temp_dir:
+        temp_path = Path(temp_dir)
+        env_path = temp_path / ".env.local"
+        env_path.write_text(
+            "\n".join(
+                [
+                    "WECHAT_STORE_APP_ID=wx-refresh",
+                    "WECHAT_STORE_APP_SECRET=secret-refresh",
+                    "WECHAT_STORE_ACCESS_TOKEN=expired-token",
+                    "WECHAT_STORE_ACCESS_TOKEN_EXPIRES_AT=2020-01-01T00:00:00Z",
+                    "WECHAT_STORE_API_BASE_URL=https://api.example.test",
+                    "WECHAT_STORE_SHOP_ID=config-shop",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        original_env_path = admin_app.ENV_LOCAL_PATH
+        original_repository = admin_app.repository
+        original_sync = admin_app.run_wechat_api_sync
+        original_token_http = admin_app.request_stable_access_token
+        admin_app.ENV_LOCAL_PATH = env_path
+        admin_app.repository = lambda: LocalRepository(db_path=temp_path / "warehouse.sqlite")
+        admin_app.run_wechat_api_sync = fake_sync
+        admin_app.request_stable_access_token = lambda **_: {"access_token": "fresh-token", "expires_in": 7200}
+        try:
+            result = admin_app.create_api_sync_run(
+                admin_app.ApiSyncRunRequest(date_from="2026-06-01", date_to="2026-06-01", generate_report=False)
+            )
+        finally:
+            admin_app.ENV_LOCAL_PATH = original_env_path
+            admin_app.repository = original_repository
+            admin_app.run_wechat_api_sync = original_sync
+            admin_app.request_stable_access_token = original_token_http
+
+        assert result["status"] == "ok"
+        assert calls[0]["access_token"] == "fresh-token"
+        assert admin_app.parse_env_file(env_path)["WECHAT_STORE_ACCESS_TOKEN"] == "fresh-token"
 
 
 def test_empty_database_and_missing_run_do_not_raise() -> None:
