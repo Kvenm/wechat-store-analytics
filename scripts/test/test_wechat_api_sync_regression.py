@@ -7,6 +7,7 @@ import sys
 import tempfile
 import traceback
 import urllib.parse
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -28,6 +29,7 @@ DETAIL_SECRET = "wechat-api-detail-secret-must-not-persist-1b2a"
 def main() -> int:
     tests: tuple[Callable[[], None], ...] = (
         test_wechat_api_sync_fetches_details_and_persists_standard_tables,
+        test_wechat_api_sync_splits_aftersale_date_range_by_day,
         test_wechat_api_sync_supports_generic_compass_standard_table,
         test_wechat_api_sync_supports_custom_generic_standard_table_endpoint,
     )
@@ -104,6 +106,34 @@ def test_wechat_api_sync_supports_generic_compass_standard_table() -> None:
             assert row["visitor_count"] == 42.0
             assert row["payment_amount"] == 899.0
         assert_no_sensitive_values(db_path, archive_dir)
+
+
+def test_wechat_api_sync_splits_aftersale_date_range_by_day() -> None:
+    with tempfile.TemporaryDirectory(prefix="wechat_api_sync_aftersale_window_") as temp_dir:
+        temp_path = Path(temp_dir)
+        db_path = temp_path / "wechat.sqlite"
+        archive_dir = temp_path / "raw-api"
+        fake_http = FakeWechatHttp()
+        result = run_wechat_api_sync(
+            db_path=db_path,
+            archive_dir=archive_dir,
+            shop_id=SHOP_ID,
+            shop_name=SHOP_NAME,
+            date_from="2026-06-01",
+            date_to="2026-06-03",
+            sync_run_id=SYNC_RUN_ID,
+            access_token=ACCESS_TOKEN,
+            api_base_url="https://fake.weixin.test",
+            endpoints=["aftersale"],
+            http_post=fake_http.post_json,
+        )
+        assert result["status"] == "completed"
+        list_calls = [call for call in fake_http.calls if call["path"] == "/channels/ec/aftersale/getaftersalelist"]
+        assert len(list_calls) == 3
+        assert [
+            call["body"]["begin_create_time"] for call in list_calls
+        ] == [unix_time("2026-06-01", False), unix_time("2026-06-02", False), unix_time("2026-06-03", False)]
+        assert all(call["body"]["end_create_time"] - call["body"]["begin_create_time"] < 24 * 60 * 60 for call in list_calls)
 
 
 def test_wechat_api_sync_supports_custom_generic_standard_table_endpoint() -> None:
@@ -358,6 +388,12 @@ def connect(path: Path) -> sqlite3.Connection:
 
 def table_count(conn: sqlite3.Connection, table: str) -> int:
     return int(conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()["count"])
+
+
+def unix_time(value: str, is_end: bool) -> int:
+    day = datetime.fromisoformat(value).date()
+    at_time = time.max if is_end else time.min
+    return int(datetime.combine(day, at_time, tzinfo=timezone(timedelta(hours=8))).timestamp())
 
 
 if __name__ == "__main__":

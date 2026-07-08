@@ -241,37 +241,42 @@ def run_wechat_api_sync(
 
         failed = False
         for spec in endpoint_specs:
-            cursor: str | None = None
-            for page_number in range(1, max_pages + 1):
-                item_result = _pull_endpoint_page(
-                    conn=conn,
-                    client=client,
-                    run_archive_dir=run_archive_dir,
-                    shop_id=shop_id,
-                    shop_name=shop_name,
-                    sync_run_id=sync_run_id,
-                    spec=spec,
-                    date_from=date_from,
-                    date_to=date_to,
-                    page_size=page_size,
-                    page_number=page_number,
-                    cursor=cursor,
-                    timeout=timeout,
-                    endpoint_params=endpoint_params or {},
-                )
-                item_results.append(item_result)
-                if item_result["status"] != "completed":
-                    warnings.append(
-                        {
-                            "code": "wechat_api_endpoint_failed",
-                            "endpoint": spec.endpoint,
-                            "message": item_result.get("error_message") or "endpoint failed",
-                        }
+            page_sequence = 0
+            for window_from, window_to in _date_windows(spec, date_from, date_to):
+                cursor: str | None = None
+                for page_number in range(1, max_pages + 1):
+                    page_sequence += 1
+                    item_result = _pull_endpoint_page(
+                        conn=conn,
+                        client=client,
+                        run_archive_dir=run_archive_dir,
+                        shop_id=shop_id,
+                        shop_name=shop_name,
+                        sync_run_id=sync_run_id,
+                        spec=spec,
+                        date_from=window_from,
+                        date_to=window_to,
+                        page_size=page_size,
+                        page_number=page_sequence,
+                        cursor=cursor,
+                        timeout=timeout,
+                        endpoint_params=endpoint_params or {},
                     )
-                    failed = True
-                    break
-                cursor = item_result.get("next_cursor")
-                if not item_result.get("has_more") or not cursor:
+                    item_results.append(item_result)
+                    if item_result["status"] != "completed":
+                        warnings.append(
+                            {
+                                "code": "wechat_api_endpoint_failed",
+                                "endpoint": spec.endpoint,
+                                "message": item_result.get("error_message") or "endpoint failed",
+                            }
+                        )
+                        failed = True
+                        break
+                    cursor = item_result.get("next_cursor")
+                    if not item_result.get("has_more") or not cursor:
+                        break
+                if failed:
                     break
 
         finished_at = _utc_like_now()
@@ -584,6 +589,19 @@ def _request_body(
         if extra:
             body.update(dict(extra))
     return body
+
+
+def _date_windows(spec: EndpointSpec, date_from: str | None, date_to: str | None) -> list[tuple[str | None, str | None]]:
+    if spec.date_mode != "aftersale_create_range" or not date_from or not date_to:
+        return [(date_from, date_to)]
+    start = datetime.fromisoformat(date_from).date()
+    end = datetime.fromisoformat(date_to).date()
+    if end < start:
+        return [(date_from, date_to)]
+    return [
+        ((start + timedelta(days=offset)).isoformat(), (start + timedelta(days=offset)).isoformat())
+        for offset in range((end - start).days + 1)
+    ]
 
 
 def _records_for_payload(

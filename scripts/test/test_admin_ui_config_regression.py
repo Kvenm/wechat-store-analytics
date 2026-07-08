@@ -269,27 +269,30 @@ def test_root_html_contains_auth_settings_entry() -> None:
 
     expected_fragments = (
         "authSection",
-        "授权状态",
+        "接口配置",
         "扫码登录只用于订单导出",
-        "此处只展示授权结果",
-        "当前页面只展示授权状态，不提供手动填写",
-        "接口密钥未读取",
-        "接口授权未读取",
-        "refreshConfig",
-        "/api-config",
-        "授权状态已刷新",
-    )
-    for fragment in expected_fragments:
-        assert fragment in html, f"root HTML missing auth setting element: {fragment}"
-
-    hidden_fragments = (
-        "接口应用 ID",
-        "保存授权设置",
+        "管理员服务端配置",
+        "微信小店后台首页没有这个授权按钮",
+        "接口 AppID",
+        "接口 AppSecret",
         "保存并获取接口授权",
         "saveAndFetchToken",
         "buildConfigPayload",
         'id="appId"',
         'id="appSecret"',
+        'type="password"',
+        "接口密钥未读取",
+        "接口授权未读取",
+        "refreshConfig",
+        "/api-config",
+        "接口配置已刷新",
+    )
+    for fragment in expected_fragments:
+        assert fragment in html, f"root HTML missing auth setting element: {fragment}"
+
+    hidden_fragments = (
+        "此处只展示授权结果",
+        "授权状态已刷新",
     )
     for fragment in hidden_fragments:
         assert fragment not in html, f"root HTML should not expose editable auth setting: {fragment}"

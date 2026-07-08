@@ -1827,7 +1827,7 @@ def render_admin_ui() -> str:
         <div class="panel-body stack">
           <div class="notice">
             <strong>扫码登录只用于订单导出</strong>
-            <p>数据同步需要服务端先完成接口授权；当前页面只展示授权状态，不提供手动填写。</p>
+            <p>数据同步需要服务端接口授权；微信小店后台首页没有这个授权按钮。</p>
           </div>
           <form id="apiSyncForm" class="form-grid">
             <label class="full">
@@ -1855,20 +1855,47 @@ def render_admin_ui() -> str:
 
       <section id="authSection" class="panel records menu-section" aria-labelledby="authTitle">
         <div class="panel-header">
-          <h2 id="authTitle">授权状态</h2>
-          <button type="button" id="refreshConfig">刷新状态</button>
+          <h2 id="authTitle">接口配置</h2>
+          <button type="button" id="refreshConfig">刷新配置</button>
         </div>
         <div class="panel-body stack">
           <div class="notice">
-            <strong>此处只展示授权结果</strong>
-            <p>店铺、接口应用和密钥由服务端授权流程维护。普通扫码登录不会返回接口授权。</p>
+            <strong>管理员服务端配置</strong>
+            <p>这里配置微信小店开放接口，不是网页登录授权。接口密钥保存后不会回显。</p>
           </div>
+          <form id="configForm" class="form-grid">
+            <label>
+              店铺 ID
+              <input id="shopId" name="shop_id" autocomplete="off" placeholder="例如 wxf32b82e92ba04239">
+            </label>
+            <label>
+              店铺名称
+              <input id="shopName" name="shop_name" autocomplete="off" placeholder="例如 见奥好物铺">
+            </label>
+            <label>
+              接口 AppID
+              <input id="appId" name="app_id" autocomplete="off" placeholder="微信小店自研 AppID">
+            </label>
+            <label>
+              接口 AppSecret
+              <input id="appSecret" name="app_secret" type="password" autocomplete="off" placeholder="留空则保留已保存密钥">
+            </label>
+            <input id="apiBaseUrl" type="hidden">
+            <input id="rawArchiveDir" type="hidden">
+            <input id="accessToken" type="hidden">
+            <input id="syncDryRun" class="hidden" type="checkbox">
+            <div class="button-row full">
+              <button type="submit">保存配置</button>
+              <button type="button" id="saveAndFetchToken" class="primary">保存并获取接口授权</button>
+            </div>
+          </form>
           <div class="status-row">
             <span id="appSecretStatus" class="chip">接口密钥未读取</span>
             <span id="accessTokenStatus" class="chip">接口授权未读取</span>
           </div>
           <dl id="configSummary"></dl>
           <span id="configMessage" class="message"></span>
+          <div id="tokenResult" class="result-box">接口授权状态未读取。</div>
         </div>
       </section>
 
@@ -2033,9 +2060,17 @@ def render_admin_ui() -> str:
 
     async function loadConfig() {
       if (!$("configSummary")) return;
-      setMessage("configMessage", "读取授权状态中...");
+      setMessage("configMessage", "读取接口配置中...");
       try {
         const data = await fetchJson("/api-config");
+        if ($("shopId")) $("shopId").value = data.values.shop_id || "";
+        if ($("shopName")) $("shopName").value = data.values.shop_name || "";
+        if ($("appId")) $("appId").value = data.values.app_id || "";
+        if ($("apiBaseUrl")) $("apiBaseUrl").value = data.values.api_base_url || "";
+        if ($("rawArchiveDir")) $("rawArchiveDir").value = data.values.raw_archive_dir || "";
+        if ($("syncDryRun")) $("syncDryRun").checked = Boolean(data.values.sync_dry_run);
+        if ($("appSecret")) $("appSecret").value = "";
+        if ($("accessToken")) $("accessToken").value = "";
         $("collectShopId").value = $("collectShopId").value || data.values.shop_id || "";
         $("collectShopName").value = $("collectShopName").value || data.values.shop_name || "";
         renderDefinitionList("shopInfoSummary", [
@@ -2052,9 +2087,81 @@ def render_admin_ui() -> str:
           ["授权状态", tokenStatus.configured ? "已获取" : "未获取"],
           ["有效期至", tokenStatus.expires_at || "未获取"],
         ]);
-        setMessage("configMessage", "授权状态已刷新。", "ok");
+        setMessage("configMessage", "接口配置已刷新。", "ok");
       } catch (error) {
         setMessage("configMessage", error.message, "error");
+      }
+    }
+
+    function buildConfigPayload() {
+      return {
+        app_id: $("appId").value,
+        app_secret: $("appSecret").value,
+        access_token: $("accessToken").value,
+        api_base_url: $("apiBaseUrl").value,
+        sync_dry_run: $("syncDryRun").checked,
+        raw_archive_dir: $("rawArchiveDir").value,
+        shop_id: $("shopId").value,
+        shop_name: $("shopName").value,
+      };
+    }
+
+    async function saveConfig(event) {
+      event.preventDefault();
+      setMessage("configMessage", "保存接口配置中...");
+      try {
+        await fetchJson("/api-config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(buildConfigPayload()),
+        });
+        await loadConfig();
+        setMessage("configMessage", "接口配置已保存。留空的密钥会保留旧值。", "ok");
+      } catch (error) {
+        setMessage("configMessage", error.message, "error");
+      }
+    }
+
+    function setTokenResult(text, kind = "") {
+      const el = $("tokenResult");
+      if (!el) return;
+      el.textContent = text;
+      el.className = `result-box ${kind}`.trim();
+    }
+
+    async function fetchAccessToken() {
+      setTokenResult("正在获取接口授权...");
+      try {
+        const response = await fetch("/api-token/fetch", { method: "POST" });
+        const payload = await response.json();
+        const data = payload.data || {};
+        if (!response.ok || payload.status === "error") {
+          const errcodeText = data.errcode === undefined || data.errcode === null ? "" : ` 微信返回码：${data.errcode}`;
+          setTokenResult(`${payload.message || "接口授权获取失败。"}${errcodeText}`, "error");
+          await loadConfig();
+          return;
+        }
+        const expiresText = data.expires_at ? `有效期至 ${data.expires_at}` : "有效期未返回";
+        setTokenResult(`接口授权已保存，${expiresText}。`, "ok");
+        await loadConfig();
+      } catch (error) {
+        setTokenResult(error.message, "error");
+      }
+    }
+
+    async function saveAndFetchToken() {
+      setMessage("configMessage", "保存接口配置中...");
+      try {
+        await fetchJson("/api-config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(buildConfigPayload()),
+        });
+        setMessage("configMessage", "接口配置已保存，正在获取接口授权...");
+        await fetchAccessToken();
+      } catch (error) {
+        setMessage("configMessage", error.message, "error");
+        setTokenResult(error.message, "error");
       }
     }
 
@@ -2628,11 +2735,13 @@ def render_admin_ui() -> str:
       await Promise.all([loadConfig(), loadCapabilities(), loadTasks(), loadRecords()]);
     }
 
+    $("configForm")?.addEventListener("submit", saveConfig);
     $("refreshHealth")?.addEventListener("click", loadHealth);
     $("refreshConfig")?.addEventListener("click", loadConfig);
     $("refreshWebLogin")?.addEventListener("click", loadWebLoginStatus);
     $("refreshRecords")?.addEventListener("click", loadRecords);
     $("refreshAll")?.addEventListener("click", refreshAll);
+    $("saveAndFetchToken")?.addEventListener("click", saveAndFetchToken);
     $("openWebLogin")?.addEventListener("click", openWebLogin);
     $("orderTaskForm")?.addEventListener("submit", startOrderTask);
     $("localExportForm")?.addEventListener("submit", startLocalExportTask);
