@@ -13,6 +13,9 @@ data/processed/*
 data/reports/*
 data/browser-profile/*
 data/logs/
+data/collector_jobs/
+data/diagnostics/
+data/verified-exports/
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 !data/reports/.gitkeep

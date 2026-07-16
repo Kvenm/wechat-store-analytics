@@ -5,6 +5,7 @@ import csv
 import hashlib
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import traceback
@@ -279,6 +280,8 @@ def main() -> int:
         test_full_order_export_derives_items_and_refunds,
         test_zip_export_imports_nested_workbook,
         test_empty_manifest_imports_nothing,
+        test_source_file_path_is_stable_for_absolute_and_relative_source_dirs,
+        test_order_rows_without_id_and_created_at_are_skipped,
     )
 
     failed = 0
@@ -677,6 +680,44 @@ def test_empty_manifest_imports_nothing() -> None:
         assert_counts(batch, orders=0)
         assert_all_standard_tables_empty(batch)
         assert_has_warning(batch, "manifest_no_completed_export_files")
+
+
+def test_source_file_path_is_stable_for_absolute_and_relative_source_dirs() -> None:
+    with tempfile.TemporaryDirectory(prefix="wechat_manifest_regression_", dir=PROJECT_ROOT) as source_dir:
+        source_path = Path(source_dir).resolve()
+        write_csv(source_path / "orders.csv", ORDERS_HEADERS, ORDERS_ROWS)
+
+        original_cwd = Path.cwd()
+        try:
+            os.chdir(PROJECT_ROOT)
+            absolute_batch = import_source(source_path)
+            relative_batch = import_source(source_path.relative_to(PROJECT_ROOT))
+        finally:
+            os.chdir(original_cwd)
+
+    absolute_order = absolute_batch.orders[0]
+    relative_order = relative_batch.orders[0]
+    assert absolute_order["source_file"] == relative_order["source_file"]
+    assert not Path(str(absolute_order["source_file"])).is_absolute()
+    assert absolute_order["row_fingerprint"] == relative_order["row_fingerprint"]
+
+
+def test_order_rows_without_id_and_created_at_are_skipped() -> None:
+    with temp_source_dir() as source_dir:
+        write_csv(
+            Path(source_dir) / "orders.csv",
+            ORDERS_HEADERS,
+            [
+                ("order-001", "2026-06-01 10:00:00", "12.30", "paid"),
+                ("", "", "12.30", "paid"),
+                ("order-002", "2026-06-01 11:00:00", "45.60", "paid"),
+            ],
+        )
+
+        batch = import_source(source_dir)
+
+        assert_counts(batch, orders=2)
+        assert_has_warning(batch, "orders_export_rows_without_identity_skipped")
 
 
 def temp_source_dir() -> tempfile.TemporaryDirectory[str]:

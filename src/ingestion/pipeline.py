@@ -11,7 +11,7 @@ from ingestion.readers import ArtifactMatch, iter_source_files, load_artifact_ma
 from shared.field_mapping import load_custom_field_map, match_fields, match_fields_detail
 from shared.ids import fingerprint, stable_json
 from shared.parsing import clean_cell, to_float, to_iso_datetime, to_text
-from shared.paths import ensure_dir
+from shared.paths import PROJECT_ROOT, ensure_dir
 from shared.table_catalog import required_fields_for_table, table_for_export_type
 
 
@@ -101,7 +101,7 @@ def build_import_batch(
                 custom_map,
             )
             table = guessed_table
-            source_file = str(path)
+            source_file = _canonical_source_file(path)
             inspection = _base_source_inspection(
                 frame,
                 source_file=source_file,
@@ -260,6 +260,14 @@ def _allowed_tables_for_expected_types(expected_types: Sequence[str] | None) -> 
     return allowed
 
 
+def _canonical_source_file(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(PROJECT_ROOT.resolve()))
+    except ValueError:
+        return str(resolved)
+
+
 def _base_source_inspection(
     frame,
     *,
@@ -401,7 +409,11 @@ def dedupe_order_records(
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     by_key: dict[tuple[object, object], dict[str, object]] = {}
     duplicate_count = 0
+    skipped_missing_identity_count = 0
     for record in records:
+        if record.get("_generated_order_id") and not record.get("order_created_at"):
+            skipped_missing_identity_count += 1
+            continue
         key = (record.get("shop_id"), record.get("order_id") or record.get("row_fingerprint"))
         if key not in by_key:
             by_key[key] = record
@@ -418,6 +430,16 @@ def dedupe_order_records(
                 "source_sheet": source_sheet or "",
                 "duplicate_row_count": duplicate_count,
                 "message": "订单导出表存在同一订单多行，订单表已按订单号合并；商品行保留在订单明细表",
+            }
+        )
+    if skipped_missing_identity_count:
+        warnings.append(
+            {
+                "code": "orders_export_rows_without_identity_skipped",
+                "source_file": source_file,
+                "source_sheet": source_sheet or "",
+                "skipped_row_count": skipped_missing_identity_count,
+                "message": "订单导出表存在缺少订单号和下单时间的页面重复行，已从订单表排除",
             }
         )
     return list(by_key.values()), warnings

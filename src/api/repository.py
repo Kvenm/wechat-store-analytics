@@ -197,9 +197,13 @@ class LocalRepository:
                 updated_at
             FROM api_task_runs
             WHERE task_id = ? OR collection_task_id = ?
-            ORDER BY COALESCE(started_at, created_at) DESC, updated_at DESC
+            ORDER BY
+                CASE WHEN task_id = ? THEN 0 ELSE 1 END,
+                COALESCE(started_at, created_at) DESC,
+                updated_at DESC
+            LIMIT 1
             """,
-            (task_id, task_id),
+            (task_id, task_id, task_id),
         )
         if row is None:
             return None
@@ -209,6 +213,33 @@ class LocalRepository:
             for step in self.list_api_task_run_steps(str(row.get("task_id")))
         }
         return task
+
+    def get_api_task_run_download_record(self, task_id: str) -> dict[str, Any] | None:
+        """Return the unredacted path fields used only by the authenticated download route."""
+        row = self._fetch_one(
+            """
+            SELECT task_id, state, status, source_dir, metadata_path, result_json
+            FROM api_task_runs
+            WHERE task_id = ? OR collection_task_id = ?
+            ORDER BY
+                CASE WHEN task_id = ? THEN 0 ELSE 1 END,
+                COALESCE(started_at, created_at) DESC,
+                updated_at DESC
+            LIMIT 1
+            """,
+            (task_id, task_id, task_id),
+        )
+        if row is None:
+            return None
+        return {
+            "id": row.get("task_id"),
+            "task_id": row.get("task_id"),
+            "state": row.get("state"),
+            "status": row.get("status"),
+            "source_dir": row.get("source_dir"),
+            "metadata_path": row.get("metadata_path"),
+            "result": _parse_json_field(row.get("result_json")),
+        }
 
     def list_api_task_run_steps(self, task_id: str) -> list[dict[str, Any]]:
         return self._fetch_all(
@@ -799,19 +830,29 @@ def _normalize_status(value: Any) -> str:
 
 def _normalize_api_task_run(row: dict[str, Any]) -> dict[str, Any]:
     task_id = row.get("task_id")
-    error = _parse_public_json_field(row.get("error_json"))
+    interrupted = row.get("state") in ("queued", "running") or row.get("status") in ("queued", "running")
+    error = (
+        {
+            "type": "TaskInterrupted",
+            "message": "任务因服务重启或进程中断而未完成，请重新创建任务。",
+        }
+        if interrupted
+        else _parse_public_json_field(row.get("error_json"))
+    )
+    spec = _parse_public_json_field(row.get("spec_json"))
     return _without_none(
         {
             "id": task_id,
             "task_id": task_id,
             "collection_task_id": row.get("collection_task_id"),
             "source": "api_task_runs",
-            "state": row.get("state"),
-            "status": row.get("status"),
+            "state": "failed" if interrupted else row.get("state"),
+            "status": "failed" if interrupted else row.get("status"),
             "shop_id": row.get("shop_id"),
             "shop_name_snapshot": _sanitize_public_text(row.get("shop_name_snapshot")),
             "task_name": _sanitize_public_text(row.get("task_name")),
             "source_type": row.get("source_type"),
+            "mode": spec.get("mode") if isinstance(spec, dict) else None,
             "date_range": {
                 "from": row.get("date_from"),
                 "to": row.get("date_to"),

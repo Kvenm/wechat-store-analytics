@@ -106,6 +106,7 @@ export async function runCollection(argv = process.argv.slice(2), options = {}) 
 export function parseCollectArgs(argv) {
   const args = {
     headless: undefined,
+    cdpUrl: undefined,
     types: undefined,
     allShops: false,
     checkConfig: false
@@ -256,6 +257,7 @@ export function buildCollectionTask(args, config, projectRoot = PROJECT_ROOT, no
   const requestedTypes = args.types ?? defaults.types ?? fallbackTypes;
   const types = normalizeTypes(requestedTypes, supportedTypes);
   const headless = args.headless ?? defaults.headless ?? DEFAULT_HEADLESS;
+  const cdpUrl = args.cdpUrl ?? defaults.cdpUrl ?? process.env.WECHAT_STORE_CDP_URL ?? null;
   const shopSelection = buildShopSelection(args, config.shops);
   const taskShopSegment = shopSelection.mode === 'all'
     ? 'all_shops'
@@ -281,6 +283,7 @@ export function buildCollectionTask(args, config, projectRoot = PROJECT_ROOT, no
     to: args.to,
     types,
     headless,
+    cdp_url: cdpUrl,
     login_timeout_ms: Number(defaults.loginTimeoutMs ?? 10 * 60 * 1000),
     download_timeout_ms: Number(defaults.downloadTimeoutMs ?? 2 * 60 * 1000),
     project_root: projectRoot,
@@ -297,6 +300,7 @@ function readStringOption(argv, index, arg) {
   const optionNames = new Map([
     ['--shop-id', 'shopId'],
     ['--shops', 'shops'],
+    ['--cdp-url', 'cdpUrl'],
     ['--from', 'from'],
     ['--to', 'to'],
     ['--types', 'types']

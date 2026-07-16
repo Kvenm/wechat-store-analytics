@@ -102,6 +102,7 @@ def _fill_defaults(
     if table == "orders":
         record.setdefault("currency", "CNY")
         if not record.get("order_id"):
+            record["_generated_order_id"] = True
             record["order_id"] = fingerprint(shop_id, source_file, source_sheet, record.get("source_row_number"), raw_row)
     elif table == "order_items":
         if not record.get("order_item_id"):

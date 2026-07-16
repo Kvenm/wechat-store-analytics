@@ -152,6 +152,8 @@ export class WechatStoreCollector {
     this.projectRoot = projectRoot;
     this.logger = logger;
     this.context = null;
+    this.browser = null;
+    this.attachedToExistingBrowser = false;
     this.page = null;
     this.exports = [];
     this.artifacts = [];
@@ -164,12 +166,25 @@ export class WechatStoreCollector {
     const startedAt = new Date().toISOString();
     const { chromium } = await import('playwright');
 
-    this.context = await chromium.launchPersistentContext(this.task.profile_dir, {
-      headless: this.task.headless,
-      acceptDownloads: true,
-      downloadsPath: this.task.download_dir,
-      viewport: { width: 1440, height: 1000 }
-    });
+    if (this.task.cdp_url) {
+      try {
+        this.browser = await chromium.connectOverCDP(this.task.cdp_url);
+        this.context = this.browser.contexts()[0];
+        this.attachedToExistingBrowser = Boolean(this.context);
+        this.logger.log(`Connected to existing login browser at ${this.task.cdp_url}`);
+      } catch (error) {
+        this.logger.warn(`Could not connect to existing login browser at ${this.task.cdp_url}: ${error?.message ?? error}`);
+      }
+    }
+
+    if (!this.context) {
+      this.context = await chromium.launchPersistentContext(this.task.profile_dir, {
+        headless: this.task.headless,
+        acceptDownloads: true,
+        downloadsPath: this.task.download_dir,
+        viewport: { width: 1440, height: 1000 }
+      });
+    }
 
     this.page = this.context.pages()[0] ?? await this.context.newPage();
 
@@ -208,7 +223,9 @@ export class WechatStoreCollector {
       });
       throw error;
     } finally {
-      await this.context?.close();
+      if (!this.attachedToExistingBrowser) {
+        await this.context?.close();
+      }
     }
   }
 

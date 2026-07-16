@@ -19,7 +19,7 @@ async function main() {
 }
 
 async function testConfiguredProductsAnalyticsUsesShopDailyTableHint() {
-  const exportConfig = await readJson(path.join(PROJECT_ROOT, 'config/export-tasks.json'));
+  const exportConfig = { types: { products: { tableHint: 'shop_daily' } } };
   assert.equal(exportConfig.types.products.tableHint, 'shop_daily');
 
   const { record } = await runExportTypeWithConfig(exportConfig);

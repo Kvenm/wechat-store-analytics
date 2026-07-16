@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6,8 +7,22 @@ import { chromium } from 'playwright';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const profileDir = path.join(projectRoot, 'data', 'browser-profile');
-const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-const outputDir = path.join(projectRoot, 'data', 'raw', 'manual-orders', timestamp);
+const runStartedAt = new Date();
+const timestamp = runStartedAt.toISOString().replace(/[:.]/g, '-');
+const args = parseArgs(process.argv.slice(2));
+const taskId = args.shopId && args.from && args.to
+  ? [
+      'collect',
+      safePathSegment(args.shopId),
+      args.from,
+      args.to,
+      'visible_orders',
+      timestamp
+    ].join('_')
+  : null;
+const outputDir = taskId
+  ? path.join(projectRoot, 'data', 'raw', taskId)
+  : path.join(projectRoot, 'data', 'raw', 'manual-orders', timestamp);
 
 const STORE_URL = 'https://store.weixin.qq.com/';
 const ORDER_NAV_SELECTOR = 'a[href="/shop/order/list"]';
@@ -16,9 +31,11 @@ const OUTPUT_JSON = path.join(outputDir, 'orders_visible_page.json');
 const OUTPUT_CSV = path.join(outputDir, 'orders_visible_page.csv');
 const DEBUG_JSON = path.join(outputDir, 'debug.json');
 const SCREENSHOT = path.join(outputDir, 'screenshot.png');
+const TASK_METADATA = path.join(outputDir, 'task-metadata.json');
+const ARTIFACT_MANIFEST = path.join(outputDir, 'artifacts-manifest.json');
 
 const context = await chromium.launchPersistentContext(profileDir, {
-  headless: false,
+  headless: args.headless,
   acceptDownloads: false,
   viewport: { width: 1440, height: 1000 },
   args: ['--disable-crash-reporter']
@@ -35,7 +52,7 @@ try {
   await page.goto(STORE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
   logStage('wait_for_logged_in_shell');
-  await waitForLoggedInShell(page, Number(process.env.WECHAT_STORE_LOGIN_TIMEOUT_MS ?? 30000));
+  await waitForLoggedInShell(page, Number(process.env.WECHAT_STORE_LOGIN_TIMEOUT_MS ?? 600000));
   await waitForPageStability(page);
   logStage('logged_in_shell', { url: page.url() });
 
@@ -46,6 +63,7 @@ try {
     .then(cleanSingleLine)
     .catch(() => '');
   logStage('current_shop', { currentShop });
+  assertExpectedShop(currentShop, args.shopName);
 
   logStage('enter_orders_page');
   await enterOrdersPage(page);
@@ -60,13 +78,30 @@ try {
   lastDebug = snapshot.debug;
 
   const rows = normalizeRows(snapshot.rows);
+  const metadata = {
+    taskId: taskId ?? `manual_orders_${timestamp}`,
+    shopId: args.shopId || 'manual-shop',
+    shopName: args.shopName || currentShop || args.shopId || '手动采集店铺',
+    dateFrom: args.from || todayIsoDate(runStartedAt),
+    dateTo: args.to || todayIsoDate(runStartedAt)
+  };
   await writeOrdersArtifacts(rows, {
     currentShop,
     pageUrl: page.url(),
     title: await page.title().catch(() => ''),
     capturedAt: new Date().toISOString(),
     outputDir,
-    rowCount: rows.length
+    rowCount: rows.length,
+    data_coverage: 'visible_viewport',
+    date_filter_applied: false,
+    date_range_semantics: 'requested_only_not_applied'
+  });
+  await writeRunMetadata({
+    ...metadata,
+    currentShop,
+    pageUrl: page.url(),
+    rowCount: rows.length,
+    status: 'completed'
   });
 
   await saveDebugAndScreenshot(page, {
@@ -81,6 +116,8 @@ try {
     rowCount: rows.length,
     csv: OUTPUT_CSV,
     json: OUTPUT_JSON,
+    metadata: TASK_METADATA,
+    manifest: ARTIFACT_MANIFEST,
     debug: DEBUG_JSON,
     screenshot: SCREENSHOT
   });
@@ -250,14 +287,24 @@ async function clickAllowedOrderHref(targetPage) {
 
 async function waitForVisibleOrderList(targetPage, timeoutMs) {
   const startedAt = Date.now();
+  const minimumEmptyWaitMs = Number(process.env.WECHAT_STORE_EMPTY_STATE_MIN_WAIT_MS ?? 8000);
+  let stableEmptyCount = 0;
   let lastSnapshot = null;
 
   while (Date.now() - startedAt < timeoutMs) {
     lastSnapshot = await readVisibleOrdersSnapshot(targetPage);
     lastDebug = lastSnapshot.debug;
 
-    if (lastSnapshot.rows.length > 0 || lastSnapshot.debug.hasEmptyOrderState || lastSnapshot.debug.hasOrderListSurface) {
+    if (lastSnapshot.rows.length > 0) {
       return;
+    }
+    if (lastSnapshot.debug.hasEmptyOrderState) {
+      stableEmptyCount += 1;
+      if (Date.now() - startedAt >= minimumEmptyWaitMs && stableEmptyCount >= 3) {
+        return;
+      }
+    } else {
+      stableEmptyCount = 0;
     }
 
     await targetPage.waitForTimeout(1000);
@@ -505,14 +552,19 @@ function normalizeRows(rawRows) {
     }
 
     const orderId = extractOrderId(rawText);
+    if (!orderId) {
+      continue;
+    }
     const createdAt = extractCreatedAt(rawText);
     const key = orderId ? `${orderId}|${createdAt}` : rawText;
+    const amountCandidates = extractAmountCandidates(rawText);
     const normalized = {
       raw_text: rawText,
       order_id: orderId,
       created_at: createdAt,
       status: extractStatus(rawText),
-      amount_candidates_json: extractAmountCandidates(rawText),
+      payment_amount: extractPaymentAmount(amountCandidates),
+      amount_candidates_json: amountCandidates,
       product_text: extractProductText(rawText, rawRow.lines ?? []),
       buyer_text: extractBuyerText(rawText, rawRow.lines ?? []),
       frame_name: rawRow.frameName ?? '',
@@ -524,10 +576,6 @@ function normalizeRows(rawRows) {
     if (orderId && !createdAt && normalized.amount_candidates_json.length === 0 && !normalized.status) {
       continue;
     }
-    if (!orderId && rows.some((row) => row.product_text && normalized.product_text && row.product_text.includes(normalized.product_text.slice(0, 16)))) {
-      continue;
-    }
-
     if (seen.has(key)) {
       const existingIndex = seen.get(key);
       if (normalized.raw_text.length > rows[existingIndex].raw_text.length) {
@@ -609,6 +657,25 @@ function extractAmountCandidates(text) {
   return candidates.slice(0, 20);
 }
 
+function extractPaymentAmount(candidates) {
+  for (const candidate of candidates) {
+    const amount = parseMoney(candidate);
+    if (amount !== '') {
+      return amount;
+    }
+  }
+  return '';
+}
+
+function parseMoney(value) {
+  const match = String(value ?? '').replace(/,/g, '').match(/\d{1,9}(?:\.\d{1,2})?/);
+  if (!match) {
+    return '';
+  }
+  const numeric = Number(match[0]);
+  return Number.isFinite(numeric) ? numeric.toFixed(2) : '';
+}
+
 function extractProductText(text, lines) {
   const labelMatch = text.match(/(?:商品信息|商品名称|商品)\s*[:：]?\s*(.{2,160}?)(?=\s*(?:买家|买家昵称|客户|顾客|收货人|收件人|订单|下单时间|付款时间|实付|应付|金额|合计|总计|状态|待付款|待支付|待发货|待收货|已发货|已完成|已关闭|已取消|售后中|退款中|退款成功|$))/);
   if (labelMatch?.[1]) {
@@ -643,10 +710,11 @@ async function writeOrdersArtifacts(rows, metadata) {
     row_index: row.row_index,
     raw_text: row.raw_text,
     order_id: row.order_id,
-    created_at: row.created_at,
+    order_created_at: row.created_at,
     status: row.status,
+    payment_amount: row.payment_amount,
     amount_candidates_json: row.amount_candidates_json,
-    product_text: row.product_text,
+    product_name: row.product_text,
     buyer_text: row.buyer_text,
     frame_name: row.frame_name,
     frame_url: row.frame_url,
@@ -671,10 +739,11 @@ async function writeOrdersArtifacts(rows, metadata) {
     row_index: row.row_index,
     raw_text: row.raw_text,
     order_id: row.order_id,
-    created_at: row.created_at,
+    order_created_at: row.created_at,
     status: row.status,
+    payment_amount: row.payment_amount,
     amount_candidates_json: JSON.stringify(row.amount_candidates_json),
-    product_text: row.product_text,
+    product_name: row.product_text,
     buyer_text: row.buyer_text
   }));
   await fs.writeFile(OUTPUT_CSV, toCsv(csvRows), 'utf8');
@@ -697,15 +766,112 @@ async function saveDebugAndScreenshot(targetPage, payload) {
   await targetPage.screenshot({ path: SCREENSHOT, fullPage: true }).catch(() => {});
 }
 
+async function writeRunMetadata({
+  taskId,
+  shopId,
+  shopName,
+  dateFrom,
+  dateTo,
+  currentShop,
+  pageUrl,
+  rowCount,
+  status
+}) {
+  const artifact = await buildArtifact({
+    taskId,
+    shopId,
+    shopName,
+    dateFrom,
+    dateTo,
+    rowCount
+  });
+  const createdAt = new Date().toISOString();
+  const metadata = {
+    task_id: taskId,
+    status,
+    source_type: 'collector_export',
+    collector_mode: 'visible_orders_page',
+    shop_id: shopId,
+    shop_name: shopName,
+    current_shop: currentShop,
+    page_url: pageUrl,
+    date_range: { from: dateFrom, to: dateTo },
+    data_coverage: 'visible_viewport',
+    date_filter_applied: false,
+    date_range_semantics: 'requested_only_not_applied',
+    types: ['orders'],
+    artifacts: [artifact],
+    items: [
+      {
+        shop_id: shopId,
+        shop_name: shopName,
+        type: 'orders',
+        label: '订单可见页采集',
+        status,
+        export: artifact,
+        error: null,
+        row_count: rowCount
+      }
+    ],
+    started_at: runStartedAt.toISOString(),
+    finished_at: createdAt,
+    created_at: createdAt
+  };
+  const manifest = {
+    task_id: taskId,
+    generated_at: createdAt,
+    artifact_count: 1,
+    artifacts: [artifact]
+  };
+
+  await fs.writeFile(TASK_METADATA, JSON.stringify(metadata, null, 2), 'utf8');
+  await fs.writeFile(ARTIFACT_MANIFEST, JSON.stringify(manifest, null, 2), 'utf8');
+}
+
+async function buildArtifact({ taskId, shopId, shopName, dateFrom, dateTo, rowCount }) {
+  const stats = await fs.stat(OUTPUT_CSV);
+  return {
+    source_kind: 'export_file',
+    source_type: 'export_file',
+    export_type: 'orders',
+    table_hint: 'orders',
+    shop_id: shopId,
+    shop_name: shopName,
+    date_range: { from: dateFrom, to: dateTo },
+    saved_path: path.basename(OUTPUT_CSV),
+    original_filename: path.basename(OUTPUT_CSV),
+    metadata: {
+      task_id: taskId,
+      collector_mode: 'visible_orders_page',
+      row_count: rowCount,
+      data_coverage: 'visible_viewport',
+      date_filter_applied: false,
+      date_range_semantics: 'requested_only_not_applied'
+    },
+    sha256: await sha256File(OUTPUT_CSV),
+    size_bytes: stats.size,
+    status: 'completed',
+    error: null,
+    created_at: new Date().toISOString()
+  };
+}
+
+async function sha256File(filePath) {
+  const hash = crypto.createHash('sha256');
+  hash.update(await fs.readFile(filePath));
+  return hash.digest('hex');
+}
+
 function toCsv(rows) {
   const headers = [
     'row_index',
     'raw_text',
     'order_id',
-    'created_at',
+    'order_created_at',
     'status',
+    'payment_amount',
     'amount_candidates_json',
-    'product_text',
+    'product_name',
     'buyer_text'
   ];
   return [
@@ -728,4 +894,92 @@ function cleanSingleLine(value) {
 
 function logStage(stage, fields = {}) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), stage, ...fields }, null, 2));
+}
+
+function assertExpectedShop(currentShopText, expectedShopName) {
+  const current = cleanSingleLine(currentShopText);
+  if (!current) {
+    throw new Error('无法确认当前登录店铺，已停止采集');
+  }
+  const expected = cleanSingleLine(expectedShopName);
+  if (!expected || expected === '手动采集店铺') {
+    return;
+  }
+  if (current.includes(expected)) {
+    return;
+  }
+  throw new Error(`当前登录店铺与任务店铺不一致：当前=${current || '<未识别>'}，任务=${expected}`);
+}
+
+function parseArgs(argv) {
+  const parsed = {
+    headless: false,
+    types: ['orders']
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === '--headless') {
+      const next = argv[index + 1];
+      if (next && !next.startsWith('--')) {
+        parsed.headless = parseBoolean(next);
+        index += 1;
+      } else {
+        parsed.headless = true;
+      }
+      continue;
+    }
+    if (arg.startsWith('--headless=')) {
+      parsed.headless = parseBoolean(arg.slice('--headless='.length));
+      continue;
+    }
+
+    const option = readStringOption(argv, index, arg);
+    if (option) {
+      parsed[option.name] = option.value;
+      index = option.nextIndex;
+      continue;
+    }
+  }
+
+  if (parsed.types) {
+    parsed.types = String(parsed.types).split(',').map((item) => item.trim()).filter(Boolean);
+  }
+  return parsed;
+}
+
+function readStringOption(argv, index, arg) {
+  const names = new Map([
+    ['--shop-id', 'shopId'],
+    ['--shop-name', 'shopName'],
+    ['--from', 'from'],
+    ['--to', 'to'],
+    ['--types', 'types']
+  ]);
+
+  for (const [flag, name] of names.entries()) {
+    if (arg === flag) {
+      const next = argv[index + 1];
+      if (!next || next.startsWith('--')) {
+        throw new Error(`${flag} requires a value.`);
+      }
+      return { name, value: next, nextIndex: index + 1 };
+    }
+    if (arg.startsWith(`${flag}=`)) {
+      return { name, value: arg.slice(flag.length + 1), nextIndex: index };
+    }
+  }
+  return null;
+}
+
+function parseBoolean(value) {
+  return ['1', 'true', 'yes', 'y'].includes(String(value).trim().toLowerCase());
+}
+
+function safePathSegment(value) {
+  return String(value || 'unknown').replace(/[^A-Za-z0-9_.-]+/g, '_').replace(/^[._]+|[._]+$/g, '') || 'unknown';
+}
+
+function todayIsoDate(date) {
+  return date.toISOString().slice(0, 10);
 }

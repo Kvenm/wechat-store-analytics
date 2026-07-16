@@ -251,10 +251,16 @@ def test_admin_route_refreshes_expired_token_before_sync() -> None:
         original_repository = admin_app.repository
         original_sync = admin_app.run_wechat_api_sync
         original_token_http = admin_app.request_stable_access_token
+        original_store_info_http = admin_app.request_store_basic_info
         admin_app.ENV_LOCAL_PATH = env_path
         admin_app.repository = lambda: LocalRepository(db_path=temp_path / "warehouse.sqlite")
         admin_app.run_wechat_api_sync = fake_sync
         admin_app.request_stable_access_token = lambda **_: {"access_token": "fresh-token", "expires_in": 7200}
+        admin_app.request_store_basic_info = lambda **_: {
+            "errcode": 0,
+            "errmsg": "ok",
+            "info": {"nickname": "Refreshed Shop", "username": "official-refresh-shop"},
+        }
         try:
             result = admin_app.create_api_sync_run(
                 admin_app.ApiSyncRunRequest(date_from="2026-06-01", date_to="2026-06-01", generate_report=False)
@@ -264,6 +270,7 @@ def test_admin_route_refreshes_expired_token_before_sync() -> None:
             admin_app.repository = original_repository
             admin_app.run_wechat_api_sync = original_sync
             admin_app.request_stable_access_token = original_token_http
+            admin_app.request_store_basic_info = original_store_info_http
 
         assert result["status"] == "ok"
         assert calls[0]["access_token"] == "fresh-token"

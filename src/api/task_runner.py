@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -21,9 +22,27 @@ RUNNING_STATES = {"queued", "running"}
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 TASK_OUTPUT_TAIL_LENGTH = 8000
 RAW_EXPORT_DIR = PROJECT_ROOT / "data" / "raw"
+WEB_COLLECT_TIMEOUT_SECONDS = 15 * 60
+EXPORT_ONLY_TIMEOUT_SECONDS = 30 * 60
+EXPORT_ONLY_TARGETS = (
+    "product_list",
+    "orders",
+    "fund_flows",
+    "transactions",
+    "product_core_conversion",
+    "product_traffic_funnel",
+    "product_detail",
+    "compass_buyer_profile",
+)
 
 _tasks: dict[str, dict[str, Any]] = {}
+_active_processes: dict[str, tuple[str, subprocess.Popen[str]]] = {}
 _lock = threading.RLock()
+_ORIGINAL_SUBPROCESS_RUN = subprocess.run
+
+
+class TaskCancelledError(RuntimeError):
+    pass
 
 
 class TaskRunnerError(ValueError):
@@ -97,6 +116,76 @@ def get_runtime_task(task_id: str) -> dict[str, Any] | None:
         return _public_task(task) if task is not None else None
 
 
+def cancel_runtime_task(task_id: str) -> dict[str, Any]:
+    """Cancel a queued/running task and terminate its current subprocess.
+
+    Cancellation is idempotent once a task has reached ``cancelled``. Files
+    already written by a collector are deliberately left untouched.
+    """
+    task_to_persist: dict[str, Any] | None = None
+    changed_steps: list[tuple[str, dict[str, Any]]] = []
+    process: subprocess.Popen[str] | None = None
+    cancelled_at = _now()
+    with _lock:
+        task = _tasks.get(task_id)
+        if task is None:
+            raise TaskRunnerError(f"任务不存在：{task_id}。")
+
+        state = _text(task.get("state")) or "unknown"
+        if state == "cancelled":
+            return _public_task(task)
+        if state not in RUNNING_STATES:
+            raise TaskRunnerError(f"只能取消排队中或执行中的任务，当前状态为 {state}。")
+
+        task["state"] = "cancelled"
+        task["status"] = "cancelled"
+        task["cancel_requested_at"] = cancelled_at
+        task["cancelled_at"] = cancelled_at
+        task["completed_at"] = cancelled_at
+        task["updated_at"] = cancelled_at
+        task["error"] = {
+            "type": "TaskCancelledError",
+            "code": "TASK_CANCELLED",
+            "message": "任务已由用户取消。",
+        }
+        task["result"] = _cancelled_result(task)
+        for step_key, step in task.get("steps", {}).items():
+            step_status = _text(step.get("status")) or "pending"
+            if step_status == "running":
+                step.update(
+                    status="cancelled",
+                    completed_at=cancelled_at,
+                    error="任务已由用户取消，当前步骤已终止。",
+                )
+                changed_steps.append((str(step_key), dict(step)))
+            elif step_status == "pending":
+                step.update(
+                    status="skipped",
+                    started_at=cancelled_at,
+                    completed_at=cancelled_at,
+                    parsed={
+                        "reason": "task_cancelled",
+                        "message": "任务已取消，本步骤未执行。",
+                    },
+                )
+                changed_steps.append((str(step_key), dict(step)))
+        active = _active_processes.get(task_id)
+        if active is not None:
+            task["cancelled_step"] = active[0]
+            process = active[1]
+        task_to_persist = dict(task)
+
+    _persist_task(task_to_persist)
+    for step_key, step in changed_steps:
+        _persist_step(task_id, step_key, step)
+    if process is not None:
+        _terminate_process(process)
+    cancelled = get_runtime_task(task_id)
+    if cancelled is None:  # pragma: no cover - protected by the lock above
+        raise TaskRunnerError(f"任务不存在：{task_id}。")
+    return cancelled
+
+
 def normalize_web_export_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     params = _mapping(payload.get("params"))
     requested_source_type = _text(payload.get("source_type"))
@@ -115,13 +204,18 @@ def normalize_web_export_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     date_to = _text(params.get("to") or params.get("date_to"))
     _validate_date_range(date_from, date_to)
 
-    requested_types = _normalize_types(params.get("types") or ["orders"])
-    unsupported = [item for item in requested_types if item not in web_enabled_types()]
-    if unsupported:
-        raise TaskRunnerError(
-            "本轮页面真实采集只开放已校准模块，暂不启动未校准模块。"
-            + unsupported_types_message(unsupported, mode="web")
-        )
+    export_only = mode == "export_only"
+    requested_types = _normalize_types(
+        params.get("types") or (["visible_tables"] if export_only else ["orders"])
+    )
+    requested_targets = _normalize_export_targets(params.get("targets")) if export_only else []
+    if not export_only:
+        unsupported = [item for item in requested_types if item not in web_enabled_types()]
+        if unsupported:
+            raise TaskRunnerError(
+                "本轮页面真实采集只开放已校准模块，暂不启动未校准模块。"
+                + unsupported_types_message(unsupported, mode="web")
+            )
 
     shop_id = _text(payload.get("shop_id") or params.get("shop_id"))
     shop_name = _text(params.get("shop_name"))
@@ -138,11 +232,21 @@ def normalize_web_export_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     if configured_shop and configured_shop.get("enabled") is False:
         raise TaskRunnerError(f"店铺 {shop_id} 已在 config/shops.json 中禁用。")
 
-    shop_name = shop_name or _text((configured_shop or {}).get("name")) or shop_id
-    headless = bool(params.get("headless", False))
-    task_name = _text(payload.get("task_name")) or f"订单导出分析 {date_from} 至 {date_to}"
+    configured_shop_name = _text((configured_shop or {}).get("name"))
+    shop_name = (
+        shop_name or configured_shop_name
+        if export_only
+        else shop_name or configured_shop_name or shop_id
+    )
+    headless = _effective_headless(params)
+    default_task_name = (
+        f"微信小店页面表格导出 {date_from} 至 {date_to}"
+        if export_only
+        else f"订单导出分析 {date_from} 至 {date_to}"
+    )
+    task_name = _text(payload.get("task_name")) or default_task_name
 
-    return {
+    spec = {
         "shop_id": shop_id,
         "shop_name": shop_name,
         "task_name": task_name,
@@ -152,6 +256,14 @@ def normalize_web_export_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         "types": requested_types,
         "headless": headless,
     }
+    if export_only:
+        spec["mode"] = "export_only"
+        spec["targets"] = requested_targets
+    return spec
+
+
+def _effective_headless(params: Mapping[str, Any]) -> bool:
+    return bool(params.get("headless", False)) or (sys.platform.startswith("linux") and not os.environ.get("DISPLAY"))
 
 
 def _normalize_local_export_payload(
@@ -170,6 +282,9 @@ def _normalize_local_export_payload(
         )
     )
     metadata = _read_json(metadata_path) if metadata_path is not None else {}
+    if _text(metadata.get("data_coverage")) == "visible_viewport":
+        # ponytail: viewport snapshots stay raw-only until date filtering and pagination are complete.
+        raise TaskRunnerError("当前文件只包含页面可见区域，未覆盖完整日期范围；为避免错误分析，本次不会自动导入。")
 
     shop_id = _first_text(
         payload.get("shop_id"),
@@ -246,15 +361,14 @@ def _normalize_local_export_payload(
 
 
 def _run_task(task_id: str) -> None:
-    task = _task_for_update(task_id)
-    if task is None:
+    spec = _start_task_if_queued(task_id)
+    if spec is None:
         return
 
-    _update_task(task_id, state="running", started_at=_now())
-    spec = task["spec"]
-
     try:
+        _raise_if_cancelled(task_id)
         metadata_path, metadata = _prepare_task_source(task_id, spec)
+        _raise_if_cancelled(task_id)
         collection_task_id = _text(metadata.get("task_id")) or metadata_path.parent.name
         _update_task(
             task_id,
@@ -263,6 +377,15 @@ def _run_task(task_id: str) -> None:
             metadata_path=str(metadata_path),
             collector_status=metadata.get("status"),
         )
+
+        if spec.get("mode") == "export_only":
+            _finish_export_only_task(
+                task_id=task_id,
+                metadata_path=metadata_path,
+                metadata=metadata,
+                collection_task_id=collection_task_id,
+            )
+            return
 
         _run_step(
             task_id,
@@ -360,11 +483,56 @@ def _run_task(task_id: str) -> None:
                 "reports_dir": str(DEFAULT_REPORTS_DIR),
             },
         )
+    except TaskCancelledError:
+        _finalize_cancelled_task(task_id)
     except Exception as exc:
-        _fail_task(task_id, exc)
+        if _is_task_cancelled(task_id):
+            _finalize_cancelled_task(task_id)
+        else:
+            _fail_task(task_id, exc)
 
 
 def _prepare_task_source(task_id: str, spec: Mapping[str, Any]) -> tuple[Path, dict[str, Any]]:
+    if spec.get("mode") == "export_only":
+        command = [
+            "node",
+            "scripts/collect/export-visible-tables.mjs",
+            "--shop-id",
+            str(spec["shop_id"]),
+        ]
+        if _text(spec.get("shop_name")):
+            command.extend(["--shop-name", str(spec["shop_name"])])
+        command.extend(
+            [
+                "--from",
+                str(spec["from"]),
+                "--to",
+                str(spec["to"]),
+                "--cdp-url",
+                "http://127.0.0.1:9333",
+            ]
+        )
+        targets = list(spec.get("targets") or [])
+        if not targets:
+            raise TaskRunnerError("页面导出缺少明确的导出目标，任务已停止，避免误导出全部页面。")
+        command.extend(["--targets", ",".join(str(item) for item in targets)])
+        try:
+            result = _run_step(
+                task_id,
+                "collect",
+                command,
+                timeout_seconds=EXPORT_ONLY_TIMEOUT_SECONDS,
+            )
+        except TaskRunnerError:
+            # The export collector intentionally exits non-zero for fatal browser
+            # failures, but still flushes a final JSON summary and metadata file.
+            # Recover that result so the task can retain its page-level evidence.
+            result = _failed_step_parsed_result(task_id, "collect")
+            if not _text(result.get("metadata_path")):
+                raise
+        metadata_path = _export_only_metadata_path(result)
+        return metadata_path, _read_json(metadata_path)
+
     if spec.get("source_type") == "local_export":
         metadata_path = _ensure_local_export_metadata(spec)
         metadata = _read_json(metadata_path)
@@ -403,8 +571,11 @@ def _prepare_task_source(task_id: str, spec: Mapping[str, Any]) -> tuple[Path, d
             ",".join(spec["types"]),
             "--headless",
             "true" if spec["headless"] else "false",
+            "--cdp-url",
+            "http://127.0.0.1:9333",
         ],
         parse_json=False,
+        timeout_seconds=WEB_COLLECT_TIMEOUT_SECONDS,
     )
 
     metadata_path = _find_latest_metadata_path(
@@ -416,35 +587,333 @@ def _prepare_task_source(task_id: str, spec: Mapping[str, Any]) -> tuple[Path, d
     return metadata_path, _read_json(metadata_path)
 
 
+def _finish_export_only_task(
+    *,
+    task_id: str,
+    metadata_path: Path,
+    metadata: Mapping[str, Any],
+    collection_task_id: str,
+) -> None:
+    collector_status = _text(metadata.get("status")) or "unknown"
+    artifacts = [
+        dict(artifact)
+        for artifact in metadata.get("artifacts") or []
+        if isinstance(artifact, Mapping)
+    ]
+    bundle_value = metadata.get("bundle_artifact")
+    bundle_artifact = dict(bundle_value) if isinstance(bundle_value, Mapping) else None
+    download_artifacts = [*([bundle_artifact] if bundle_artifact else []), *artifacts]
+    pages = [
+        dict(item)
+        for item in (metadata.get("pages") or metadata.get("items") or [])
+        if isinstance(item, Mapping)
+    ]
+    targets = list(metadata.get("targets")) if isinstance(metadata.get("targets"), list) else []
+    target_count = max(_int_or_default(metadata.get("target_count"), len(targets)), len(targets))
+    artifact_count = _int_or_default(metadata.get("artifact_count"), len(artifacts))
+    success_count = _count_export_items(pages, {"completed", "success"})
+    skipped_count = _count_export_items(pages, {"skipped", "no_export", "no_permission"})
+    failed_count = _count_export_items(pages, {"failed", "error"})
+    summary = _mapping(metadata.get("summary"))
+    success_count = _int_or_default(metadata.get("success_count"), _int_or_default(summary.get("success_count"), success_count))
+    skipped_count = _int_or_default(metadata.get("skipped_count"), _int_or_default(summary.get("skipped_count"), skipped_count))
+    failed_count = _int_or_default(metadata.get("failed_count"), _int_or_default(summary.get("failed_count"), failed_count))
+    collect_step = _task_step_snapshot(task_id, "collect")
+    task_error = _export_only_task_error(
+        metadata=metadata,
+        collector_status=collector_status,
+        collect_step=collect_step,
+        target_count=target_count,
+        page_count=len(pages),
+        artifact_count=artifact_count,
+    )
+
+    completed_at = _now()
+    for step_key in ("import_metadata", "import_files", "analyze", "report"):
+        _set_step(
+            task_id,
+            step_key,
+            status="skipped",
+            started_at=completed_at,
+            completed_at=completed_at,
+            parsed={
+                "mode": "export_only",
+                "message": (
+                    "页面表格导出未成功，已保留导出结果；后续入库、分析和报告不会执行。"
+                    if task_error
+                    else "本任务仅下载微信小店页面原始表格，不执行登记、入库、分析或报告。"
+                ),
+            },
+        )
+
+    if task_error and _text(collect_step.get("status")) != "failed":
+        _set_step(
+            task_id,
+            "collect",
+            status="failed",
+            completed_at=collect_step.get("completed_at") or completed_at,
+            error=task_error["message"],
+        )
+
+    result = {
+        "mode": "export_only",
+        "raw_only": True,
+        "outcome": (
+            "failed"
+            if task_error
+            else "no_files"
+            if not artifacts
+            else "partial"
+            if failed_count > 0
+            else "exported"
+        ),
+        "collection_task_id": collection_task_id,
+        "source_dir": str(metadata_path.parent),
+        "metadata_path": str(metadata_path),
+        "artifact_manifest_path": metadata.get("artifact_manifest_path"),
+        "export_results_path": metadata.get("export_results_path"),
+        "diagnostic_log_path": metadata.get("execution_log_path"),
+        "target_count": target_count,
+        "targets": targets,
+        "artifact_count": artifact_count,
+        "download_artifact_count": len(download_artifacts),
+        "bundle_available": bool(bundle_artifact),
+        "bundle_artifact": bundle_artifact,
+        "bundle_artifact_index": 0 if bundle_artifact else None,
+        "bundle_error": metadata.get("bundle_error"),
+        "success_count": success_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "collector_status": collector_status,
+        "fatal_error": bool(metadata.get("fatal_error")),
+        "scan_completed": bool(metadata.get("scan_completed")),
+        "pages": pages,
+        "artifacts": download_artifacts,
+        "notice": (
+            "页面表格导出未成功；已保留页面级结果和已生成文件，请查看失败原因。"
+            if task_error
+            else "页面扫描已完成，但没有下载到原始表格；请查看跳过/失败原因。"
+            if not artifacts
+            else "已下载部分原始表格，仍有页面失败；未执行入库、分析和报告。"
+            if failed_count > 0
+            else "已停止在原始文件导出阶段；未执行入库、分析和报告。"
+        ),
+    }
+    _update_task(
+        task_id,
+        state="failed" if task_error else "completed",
+        status="failed" if task_error else "completed",
+        completed_at=completed_at,
+        result=result,
+        error=task_error,
+    )
+
+
+def _export_only_task_error(
+    *,
+    metadata: Mapping[str, Any],
+    collector_status: str,
+    collect_step: Mapping[str, Any],
+    target_count: int,
+    page_count: int,
+    artifact_count: int,
+) -> dict[str, Any] | None:
+    collector_error_value = metadata.get("error")
+    collector_error = dict(collector_error_value) if isinstance(collector_error_value, Mapping) else {}
+    collector_message = (
+        _text(collector_error.get("message"))
+        or (_text(collector_error_value) if not isinstance(collector_error_value, Mapping) else None)
+    )
+    collect_failed = _text(collect_step.get("status")) == "failed"
+    result_list_missing = target_count > 0 and page_count == 0
+
+    if result_list_missing:
+        error_type = "ExportOnlyResultError"
+        error_code = "EXPORT_RESULTS_MISSING"
+        message = (
+            f"页面表格导出结果清单缺失：已配置 {target_count} 个导出目标，"
+            "但 task-metadata.json 未生成 pages。"
+        )
+    elif collector_status.lower() == "failed":
+        error_type = _text(collector_error.get("name")) or "ExportOnlyCollectorError"
+        error_code = _text(collector_error.get("code")) or "EXPORT_FAILED"
+        message = (
+            collector_message
+            or _text(collect_step.get("error"))
+            or "页面表格导出失败，collector status=failed。"
+        )
+    elif collect_failed:
+        error_type = _text(collector_error.get("name")) or "ExportOnlyCollectProcessError"
+        error_code = _text(collector_error.get("code")) or "COLLECT_PROCESS_FAILED"
+        message = (
+            collector_message
+            or _text(collect_step.get("error"))
+            or "页面表格导出子进程执行失败。"
+        )
+    else:
+        return None
+
+    details: dict[str, Any] = {
+        "collector_status": collector_status,
+        "fatal_error": bool(metadata.get("fatal_error")),
+        "target_count": target_count,
+        "page_count": page_count,
+        "artifact_count": artifact_count,
+    }
+    if collector_error:
+        details["collector_error"] = collector_error
+    if collect_failed:
+        details["collect_step"] = {
+            "status": collect_step.get("status"),
+            "exit_code": collect_step.get("exit_code"),
+            "message": collect_step.get("error"),
+        }
+    return {
+        "type": error_type,
+        "code": error_code,
+        "message": message,
+        "details": details,
+    }
+
+
+def _task_step_snapshot(task_id: str, step_key: str) -> dict[str, Any]:
+    with _lock:
+        task = _tasks.get(task_id)
+        step = _mapping(_mapping(task).get("steps")).get(step_key)
+        return dict(step) if isinstance(step, Mapping) else {}
+
+
+def _failed_step_parsed_result(task_id: str, step_key: str) -> dict[str, Any]:
+    step = _task_step_snapshot(task_id, step_key)
+    parsed = step.get("parsed")
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+
+def _export_only_metadata_path(result: Mapping[str, Any]) -> Path:
+    value = _text(result.get("metadata_path"))
+    if not value:
+        raise TaskRunnerError("页面表格导出脚本未返回 metadata_path。")
+
+    raw_root = RAW_EXPORT_DIR.resolve()
+    path_value = Path(value)
+    if not path_value.is_absolute():
+        path_value = PROJECT_ROOT / path_value
+    try:
+        resolved = path_value.resolve(strict=True)
+    except OSError as exc:
+        raise TaskRunnerError(f"页面表格导出 metadata 不存在：{path_value}") from exc
+    if not resolved.is_file():
+        raise TaskRunnerError(f"页面表格导出 metadata_path 不是文件：{resolved}")
+    if raw_root not in resolved.parents:
+        raise TaskRunnerError(f"页面表格导出 metadata 必须位于 data/raw 下：{resolved}")
+    return resolved
+
+
+def _count_export_items(items: list[dict[str, Any]], statuses: set[str]) -> int:
+    return sum(1 for item in items if str(item.get("status") or "").lower() in statuses)
+
+
+def _int_or_default(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _run_step(
     task_id: str,
     step_key: str,
     command: list[str],
     *,
     parse_json: bool = True,
+    timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
+    _raise_if_cancelled(task_id)
     _set_step(task_id, step_key, status="running", started_at=_now(), command=_public_command(command))
     started_at = time.time()
+    process: subprocess.Popen[str] | None = None
     try:
-        completed = subprocess.run(
-            command,
-            cwd=str(PROJECT_ROOT),
-            env=_subprocess_env(),
-            text=True,
-            capture_output=True,
-            check=False,
+        if subprocess.run is not _ORIGINAL_SUBPROCESS_RUN:
+            # Keep compatibility with existing regression fixtures that replace
+            # subprocess.run. Production always uses Popen so it can be cancelled.
+            completed = subprocess.run(
+                command,
+                cwd=str(PROJECT_ROOT),
+                env=_subprocess_env(),
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        else:
+            process = subprocess.Popen(
+                command,
+                cwd=str(PROJECT_ROOT),
+                env=_subprocess_env(),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=os.name == "posix",
+            )
+            if not _register_active_process(task_id, step_key, process):
+                _terminate_process(process)
+            try:
+                stdout, stderr = process.communicate(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired as exc:
+                _terminate_process(process)
+                stdout, stderr = process.communicate()
+                exc.stdout = stdout
+                exc.stderr = stderr
+                raise
+            completed = subprocess.CompletedProcess(
+                args=command,
+                returncode=process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+            )
+    except subprocess.TimeoutExpired as exc:
+        duration_ms = int((time.time() - started_at) * 1000)
+        stdout_tail = _tail(_decode_subprocess_output(exc.stdout))
+        stderr_tail = _tail(_decode_subprocess_output(exc.stderr))
+        if _is_task_cancelled(task_id):
+            _mark_step_cancelled(task_id, step_key, duration_ms, stdout_tail, stderr_tail)
+            raise TaskCancelledError("任务已由用户取消。") from exc
+        timeout_text = f"{timeout_seconds} 秒" if timeout_seconds is not None else "限定时间"
+        message = f"{step_key} 执行超过 {timeout_text}，已终止本次任务。"
+        _set_step(
+            task_id,
+            step_key,
+            status="failed",
+            completed_at=_now(),
+            duration_ms=duration_ms,
+            stdout_tail=stdout_tail,
+            stderr_tail=stderr_tail,
+            error=message,
         )
+        raise TaskRunnerError(message) from exc
     except OSError as exc:
+        if _is_task_cancelled(task_id):
+            _mark_step_cancelled(task_id, step_key, int((time.time() - started_at) * 1000), "", "")
+            raise TaskCancelledError("任务已由用户取消。") from exc
         _set_step(task_id, step_key, status="failed", completed_at=_now(), error=str(exc))
         raise
+    finally:
+        if process is not None:
+            _unregister_active_process(task_id, process)
 
     duration_ms = int((time.time() - started_at) * 1000)
     stdout_tail = _tail(completed.stdout)
     stderr_tail = _tail(completed.stderr)
+    if _is_task_cancelled(task_id):
+        _mark_step_cancelled(task_id, step_key, duration_ms, stdout_tail, stderr_tail)
+        raise TaskCancelledError("任务已由用户取消。")
     if completed.returncode != 0:
-        message = (
-            f"{step_key} 执行失败，exit_code={completed.returncode}。"
-            f"{(' stderr: ' + stderr_tail) if stderr_tail else ''}"
+        failed_parsed = _parse_last_json_object(completed.stdout)
+        message = _command_failure_message(
+            step_key,
+            completed.returncode,
+            stderr_tail,
+            stdout_tail,
         )
         _set_step(
             task_id,
@@ -455,6 +924,7 @@ def _run_step(
             duration_ms=duration_ms,
             stdout_tail=stdout_tail,
             stderr_tail=stderr_tail,
+            parsed=failed_parsed,
             error=message,
         )
         raise TaskRunnerError(message)
@@ -493,10 +963,85 @@ def _run_command_for_json(command: list[str], *, step_key: str) -> dict[str, Any
     if completed.returncode != 0:
         stderr_tail = _tail(completed.stderr)
         raise TaskRunnerError(
-            f"{step_key} 执行失败，exit_code={completed.returncode}。"
-            f"{(' stderr: ' + stderr_tail) if stderr_tail else ''}"
+            _command_failure_message(
+                step_key,
+                completed.returncode,
+                stderr_tail,
+                _tail(completed.stdout),
+            )
         )
     return _parse_json_stdout(completed.stdout, step_key)
+
+
+def _command_failure_message(
+    step_key: str,
+    returncode: int,
+    stderr_tail: str,
+    stdout_tail: str = "",
+) -> str:
+    if returncode < 0:
+        signal_number = abs(returncode)
+        message = f"{step_key} 执行被中断，signal={signal_number}。常见原因是服务重启、系统终止或任务进程被手动停止。"
+    else:
+        message = f"{step_key} 执行失败，exit_code={returncode}。"
+    detail = _structured_subprocess_error(stdout_tail, stderr_tail)
+    if detail:
+        return f"{message} {detail}"
+    fallback = _concise_stderr_detail(stderr_tail)
+    return f"{message}{(' ' + fallback) if fallback else ''}"
+
+
+def _structured_subprocess_error(*values: str) -> str | None:
+    for value in values:
+        text = (value or "").strip()
+        if not text:
+            continue
+        candidates = [text, *reversed(text.splitlines())]
+        for candidate in candidates:
+            parsed = _parse_json_object(candidate)
+            if not parsed:
+                continue
+            error = parsed.get("error")
+            if isinstance(error, Mapping):
+                message = _text(error.get("message"))
+            else:
+                message = _text(error)
+            message = message or _text(parsed.get("message"))
+            if message:
+                return message
+    return None
+
+
+def _parse_json_object(value: str | None) -> dict[str, Any]:
+    text = (value or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+
+def _parse_last_json_object(value: str | None) -> dict[str, Any]:
+    text = (value or "").strip()
+    parsed = _parse_json_object(text)
+    if parsed:
+        return parsed
+    for line in reversed(text.splitlines()):
+        parsed = _parse_json_object(line)
+        if parsed:
+            return parsed
+    return {}
+
+
+def _concise_stderr_detail(value: str | None) -> str | None:
+    lines = [line.strip() for line in (value or "").splitlines() if line.strip()]
+    for line in reversed(lines):
+        if line.startswith("{") and line.endswith("}"):
+            continue
+        return line if len(line) <= 500 else f"{line[:500]}..."
+    return None
 
 
 def _build_runtime_task(spec: dict[str, Any]) -> dict[str, Any]:
@@ -540,9 +1085,32 @@ def _active_task_locked() -> dict[str, Any] | None:
     return None
 
 
-def _task_for_update(task_id: str) -> dict[str, Any] | None:
+def _start_task_if_queued(task_id: str) -> dict[str, Any] | None:
+    task_to_persist: dict[str, Any] | None = None
     with _lock:
-        return _tasks.get(task_id)
+        task = _tasks.get(task_id)
+        if task is None or task.get("state") != "queued":
+            return None
+        started_at = _now()
+        task["state"] = "running"
+        task["status"] = "running"
+        task["started_at"] = started_at
+        task["updated_at"] = started_at
+        task_to_persist = dict(task)
+        spec = dict(_mapping(task.get("spec")))
+    _persist_task(task_to_persist)
+    return spec
+
+
+def _is_task_cancelled(task_id: str) -> bool:
+    with _lock:
+        task = _tasks.get(task_id)
+        return task is not None and task.get("state") == "cancelled"
+
+
+def _raise_if_cancelled(task_id: str) -> None:
+    if _is_task_cancelled(task_id):
+        raise TaskCancelledError("任务已由用户取消。")
 
 
 def _update_task(task_id: str, **updates: Any) -> None:
@@ -551,6 +1119,16 @@ def _update_task(task_id: str, **updates: Any) -> None:
         task = _tasks.get(task_id)
         if task is None:
             return
+        if task.get("state") == "cancelled" and updates.get("state") != "cancelled":
+            # A worker may finish while cancellation is being processed. Never
+            # let its late completed/failed write replace the terminal state.
+            updates = {
+                key: value
+                for key, value in updates.items()
+                if key not in {"state", "status", "completed_at", "result", "error"}
+            }
+            if not updates:
+                return
         task.update(updates)
         task["updated_at"] = _now()
         task_to_persist = dict(task)
@@ -563,6 +1141,8 @@ def _set_step(task_id: str, step_key: str, **updates: Any) -> None:
     with _lock:
         task = _tasks.get(task_id)
         if task is None:
+            return
+        if task.get("state") == "cancelled" and updates.get("status") != "cancelled":
             return
         step = task["steps"].setdefault(step_key, {})
         step.update(updates)
@@ -580,6 +1160,8 @@ def _fail_task(task_id: str, exc: Exception) -> None:
         task = _tasks.get(task_id)
         if task is None:
             return
+        if task.get("state") == "cancelled":
+            return
         task["state"] = "failed"
         task["status"] = "failed"
         task["completed_at"] = _now()
@@ -588,11 +1170,21 @@ def _fail_task(task_id: str, exc: Exception) -> None:
             "type": exc.__class__.__name__,
             "message": str(exc),
         }
+        export_only = _mapping(task.get("spec")).get("mode") == "export_only"
         for step_key, step in task["steps"].items():
             if step.get("status") == "running":
                 step["status"] = "failed"
                 step["completed_at"] = task["completed_at"]
                 step["error"] = str(exc)
+                changed_steps.append((step_key, dict(step)))
+            elif export_only and step_key != "collect" and step.get("status") == "pending":
+                step["status"] = "skipped"
+                step["started_at"] = task["completed_at"]
+                step["completed_at"] = task["completed_at"]
+                step["parsed"] = {
+                    "mode": "export_only",
+                    "message": "页面导出未通过前置检查，后续入库、分析和报告不会执行。",
+                }
                 changed_steps.append((step_key, dict(step)))
         task_to_persist = dict(task)
     _persist_task(task_to_persist)
@@ -607,16 +1199,21 @@ def _public_task(task: Mapping[str, Any]) -> dict[str, Any]:
         "collection_task_id": task.get("collection_task_id"),
         "state": task.get("state"),
         "status": task.get("status"),
+        "can_cancel": task.get("state") in RUNNING_STATES,
         "shop_id": task.get("shop_id"),
         "shop_name_snapshot": task.get("shop_name_snapshot"),
         "task_name": task.get("task_name"),
         "source_type": task.get("source_type"),
+        "mode": _mapping(task.get("spec")).get("mode"),
         "date_range": task.get("date_range"),
         "types": _mapping(task.get("spec")).get("types"),
         "headless": _mapping(task.get("spec")).get("headless"),
         "created_at": task.get("created_at"),
         "started_at": task.get("started_at"),
         "completed_at": task.get("completed_at"),
+        "cancel_requested_at": task.get("cancel_requested_at"),
+        "cancelled_at": task.get("cancelled_at"),
+        "cancelled_step": task.get("cancelled_step"),
         "updated_at": task.get("updated_at"),
         "thread_name": task.get("thread_name"),
         "steps": task.get("steps"),
@@ -627,6 +1224,104 @@ def _public_task(task: Mapping[str, Any]) -> dict[str, Any]:
         "error": task.get("error"),
         "persist_warnings": task.get("persist_warnings"),
     }
+
+
+def _cancelled_result(task: Mapping[str, Any]) -> dict[str, Any]:
+    existing = task.get("result")
+    result = dict(existing) if isinstance(existing, Mapping) else {}
+    result.update(
+        {
+            "mode": _mapping(task.get("spec")).get("mode"),
+            "outcome": "cancelled",
+            "cancelled": True,
+            "files_preserved": True,
+            "notice": "任务已取消；取消前已生成的文件予以保留。",
+        }
+    )
+    for key in ("collection_task_id", "source_dir", "metadata_path"):
+        if task.get(key) is not None:
+            result.setdefault(key, task.get(key))
+    return result
+
+
+def _finalize_cancelled_task(task_id: str) -> None:
+    """Persist the already-established cancelled state after worker unwind."""
+    with _lock:
+        task = _tasks.get(task_id)
+        task_to_persist = dict(task) if task is not None and task.get("state") == "cancelled" else None
+    _persist_task(task_to_persist)
+
+
+def _register_active_process(
+    task_id: str,
+    step_key: str,
+    process: subprocess.Popen[str],
+) -> bool:
+    with _lock:
+        task = _tasks.get(task_id)
+        if task is None or task.get("state") == "cancelled":
+            return False
+        _active_processes[task_id] = (step_key, process)
+        return True
+
+
+def _unregister_active_process(task_id: str, process: subprocess.Popen[str]) -> None:
+    with _lock:
+        active = _active_processes.get(task_id)
+        if active is not None and active[1] is process:
+            _active_processes.pop(task_id, None)
+
+
+def _mark_step_cancelled(
+    task_id: str,
+    step_key: str,
+    duration_ms: int,
+    stdout_tail: str,
+    stderr_tail: str,
+) -> None:
+    _set_step(
+        task_id,
+        step_key,
+        status="cancelled",
+        completed_at=_now(),
+        duration_ms=duration_ms,
+        stdout_tail=stdout_tail,
+        stderr_tail=stderr_tail,
+        error="任务已由用户取消，当前步骤已终止。",
+    )
+
+
+def _terminate_process(process: subprocess.Popen[str], grace_seconds: float = 2.0) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            process_group = os.getpgid(process.pid)
+            if process_group != os.getpgrp():
+                os.killpg(process_group, signal.SIGTERM)
+            else:  # Defensive fallback for callers that did not create a session.
+                process.terminate()
+        else:
+            process.terminate()
+    except (OSError, ProcessLookupError):
+        return
+
+    deadline = time.monotonic() + max(0.0, grace_seconds)
+    while process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            process_group = os.getpgid(process.pid)
+            if process_group != os.getpgrp():
+                os.killpg(process_group, signal.SIGKILL)
+            else:
+                process.kill()
+        else:
+            process.kill()
+    except (OSError, ProcessLookupError):
+        return
 
 
 def _persist_task(task: Mapping[str, Any] | None) -> None:
@@ -989,6 +1684,24 @@ def _normalize_types(value: Any) -> list[str]:
     return list(dict.fromkeys(normalized))
 
 
+def _normalize_export_targets(value: Any) -> list[str]:
+    if value is None:
+        raise TaskRunnerError("页面导出必须明确选择至少一个数据模块。")
+    if isinstance(value, str):
+        targets = [item.strip() for item in value.split(",")]
+    elif isinstance(value, list):
+        targets = [_text(item) or "" for item in value]
+    else:
+        raise TaskRunnerError("页面导出目标必须是字符串或数组。")
+    normalized = list(dict.fromkeys(item for item in targets if item))
+    if not normalized:
+        raise TaskRunnerError("页面导出至少需要选择一个数据模块。")
+    unsupported = [item for item in normalized if item not in EXPORT_ONLY_TARGETS]
+    if unsupported:
+        raise TaskRunnerError(f"页面导出包含不支持的目标：{'、'.join(unsupported)}。")
+    return normalized
+
+
 def _is_auto_types(types: list[str]) -> bool:
     return any(item.lower() == "auto" for item in types)
 
@@ -1006,6 +1719,12 @@ def _public_command(command: list[str]) -> list[str]:
 def _tail(value: str | None) -> str:
     text = value or ""
     return text[-TASK_OUTPUT_TAIL_LENGTH:]
+
+
+def _decode_subprocess_output(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:

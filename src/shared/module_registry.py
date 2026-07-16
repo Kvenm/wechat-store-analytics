@@ -13,6 +13,7 @@ class ModuleCapability:
     calibrated: bool
     source_priority: tuple[str, ...]
     notes: str
+    page_export_status: str = "not_available"
 
     def to_dict(self) -> dict[str, object]:
         data = asdict(self)
@@ -37,6 +38,7 @@ MODULE_CAPABILITIES: dict[str, ModuleCapability] = {
         calibrated=True,
         source_priority=EXPORT_SOURCE_PRIORITY,
         notes="真实网页导出已小范围跑通，导出 zip/xlsx 后会拆出 orders/order_items/refunds。",
+        page_export_status="verified",
     ),
     "product_list": ModuleCapability(
         export_type="product_list",
@@ -46,7 +48,8 @@ MODULE_CAPABILITIES: dict[str, ModuleCapability] = {
         import_enabled=True,
         calibrated=False,
         source_priority=EXPORT_SOURCE_PRIORITY,
-        notes="本轮先支持本地导出文件导入；真实页面导出按钮和状态筛选仍需登录后校准。",
+        notes="真实页面商品列表批量导出已验证，可下载商品数据 ZIP；也支持已有文件导入。",
+        page_export_status="verified",
     ),
     "products": ModuleCapability(
         export_type="products",
@@ -106,7 +109,8 @@ MODULE_CAPABILITIES: dict[str, ModuleCapability] = {
         import_enabled=True,
         calibrated=False,
         source_priority=EXPORT_SOURCE_PRIORITY,
-        notes="支持本地资金流水表导入，真实页面待校准。",
+        notes="真实页面资金流水全部导出已验证，可下载资金流水 ZIP；也支持已有文件导入。",
+        page_export_status="verified",
     ),
     "ads": ModuleCapability(
         export_type="ads",

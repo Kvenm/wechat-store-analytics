@@ -10,7 +10,10 @@
     "collect": "node scripts/collect/collect.mjs",
     "collect:orders": "node scripts/collect/collect.mjs --types orders",
     "collect:products": "node scripts/collect/collect.mjs --types products",
-    "collect:compass": "node scripts/collect/collect.mjs --types compass"
+    "collect:compass": "node scripts/collect/collect.mjs --types compass",
+    "export:visible": "node scripts/collect/export-visible-tables.mjs",
+    "test:export-visible": "node scripts/test/test_export_visible_tables_regression.mjs",
+    "test:login-check": "node scripts/test/test_check_wechat_store_login_regression.mjs"
   },
   "engines": {
     "node": ">=20"
